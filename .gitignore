@@ -7,7 +7,10 @@
 *.swp
 *.swo
 .context/
-.claude/
+# .claude/skills/ holds the repo's shared skills (read by Claude Code directly,
+# by Pi through the .agents/skills symlink); everything else stays local.
+.claude/*
+!.claude/skills/
 temp/
 __pycache__/
 *.pyc

@@ -20,6 +20,7 @@ Read the relevant doc before non-trivial work in that area; don't re-derive from
 | Everything still open | `TODO.md` |
 | Real-hardware UAT | `docs/testing/hardware-uat.md` |
 | Built-in `(arch, gpu_backend)` defaults table | `src/launch/AGENTS.md` (loads when working under `src/launch/`) |
+| Cutting a release (CHANGELOG, version bump, tag, publish, channel checks) | `.claude/skills/ls-release/SKILL.md` (same skill via `.agents/skills/ls-release`) |
 
 ## Rules
 
@@ -139,8 +140,8 @@ Never flag for deletion or `.gitignore` — these are the engineering record: `d
 
 - `cargo build` without `--features test-fixtures` intentionally omits `fake_llama_server` and `_test_sleep`; CI runs both ways to catch accidental dependence on test-only surface. `cargo install` excludes them by the same gating — don't move them out from behind `#[cfg(any(test, feature = "test-fixtures"))]`.
 - `LLAMASTASH_BENCH_DISABLE_DEFAULTS=1` collapses `resolve_layered` to User-labeled layers only (no preset / last-used / arch defaults). `scripts/bench/` sets it so `start` produces byte-identical argv to raw `llama-server`. Never set it in production — it disables the auto-tuning the launcher exists for.
-- Release publishes `publish-homebrew`, `publish-site`, and `publish-cargo` in parallel; one failing job leaves channels diverged. Recover with `gh run rerun --failed <run-id>`. Pre-release tags (`vX.Y.Z-<suffix>`) skip all three by design.
+- Release runs its seven publish jobs (Homebrew, Scoop, site, crates.io, three AUR) in parallel; one failing job leaves channels diverged. Recover with `gh run rerun --failed <run-id>`. Pre-release tags (`vX.Y.Z-<suffix>`) skip all seven by design.
 
 ## Release
 
-`git tag vX.Y.Z && git push --tags` triggers `.github/workflows/release.yml`: `release-gate` (tests + cold CPU-only UAT on Linux and macOS) → 4 target tarballs → release assets → Homebrew formula + `install.sh` mirror + crates.io. Roughly 10-15 minutes on cold caches. Pre-tag guards live in ci.yml's `release-readiness` (`cargo publish --dry-run --locked`, crates.io name availability, CHANGELOG `[Unreleased]` header, Cargo.toml ↔ CHANGELOG version alignment). Trust-critical actions in release.yml are SHA-pinned; first-party `actions/*` are tag-pinned, updated via Dependabot. First-time org / token / Pages setup: `docs/runbooks/release-0.0.1-bootstrap.md`.
+Run it through the `ls-release` skill. A `vX.Y.Z` tag push triggers `.github/workflows/release.yml`: `prepare-release` → `release-gate` (tests + cold CPU-only UAT on Linux and macOS) → `create-release` → 11 target builds → `SHA256SUMS` + install scripts → the seven publish jobs. About 25 minutes end to end. Pre-tag guards live in ci.yml's `release-readiness` (`cargo publish --dry-run --locked`, crates.io name availability, CHANGELOG `[Unreleased]` header, Cargo.toml ↔ CHANGELOG version alignment). Trust-critical actions in release.yml are SHA-pinned; first-party `actions/*` are tag-pinned, updated via Dependabot. First-time org / token / Pages setup: `docs/runbooks/release-0.0.1-bootstrap.md`.
