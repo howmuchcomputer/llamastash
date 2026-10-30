@@ -23,12 +23,13 @@ use ratatui::widgets::{Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::discovery::split_gguf::parse_shard_name;
+use crate::init::benchmark::BenchmarkSnapshot;
 use crate::init::download::RepoSpec;
 use crate::init::fetch::FetchError;
 use crate::init::hf_api::{
   format_param_count, HfRepoFile, HfSearchPage, HfSearchResult, HfSortKey, ListRepoFilesError,
 };
-use crate::init::recommender::FileFit;
+use crate::init::recommender::{FileFit, RecommendOptions, Recommendation, RecommendationKind};
 use crate::theme::Palette;
 use crate::tui::app::App;
 use crate::tui::input_field::{InputField, InputOutcome};
@@ -79,6 +80,9 @@ pub enum HfDialogEvent {
     repo_id: String,
     error: ListRepoFilesError,
   },
+  /// A benchmark snapshot newer than the one compiled into the binary. The
+  /// recommendation ranking and the per-file fit band rebuild from it.
+  Snapshot(Box<BenchmarkSnapshot>),
 }
 
 /// One row in the File picker. Either a standalone GGUF file or a
@@ -336,12 +340,29 @@ pub struct HfDialogState {
   /// File picker's per-row fit indicator. Refreshed at dialog-open
   /// time from `App::host_metrics` + the bundled benchmark snapshot.
   pub hardware_fit_ctx: HardwareFitContext,
+  /// The recommender's ranked picks for this host, shown while the
+  /// search field is empty. Same list `init` and `llamastash recommend`
+  /// offer; filled at dialog-open time. Empty when the host's GPU is
+  /// unknown, which leaves the plain "start typing" hint on screen.
+  pub recs: Vec<Recommendation>,
+  /// Quant tag to preselect in the File picker after `Enter` on a
+  /// recommendation row, so the recommended quant lands selected rather
+  /// than whatever happens to be first. Matched by the same quant rule
+  /// `init` uses for a fallback repo (`init::download`'s
+  /// `pick_quant_match`). Set by [`Self::submit_search`], cleared by that
+  /// transition or by [`Self::back_to_search`].
+  pub recommended_quant: Option<String>,
 }
 
 /// Debounce window — once this elapses after the last keystroke, the
 /// dialog dispatches the buffered query as a search (R107 / live
 /// search). Matches the HuggingFace web UI cadence.
 pub const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Header over the recommendation list. Says both what to type and what
+/// the rows underneath are, because the empty field is also the dialog's
+/// landing screen.
+const RECOMMENDATIONS_NOTE: &str = "Start typing to search HuggingFace, or paste an owner/repo slug. Below are the models recommended for this hardware.";
 
 /// Inputs to [`crate::init::recommender::vram_fit_for_file`] the file
 /// picker carries across render frames. Lifted into its own struct so
@@ -354,6 +375,12 @@ pub struct HardwareFitContext {
   pub ram_total_bytes: u64,
   pub overhead_band_bytes: Option<u64>,
   pub ctx_tokens: u32,
+  /// `true` when `vram_bytes` is the system RAM pool (Apple Silicon, UMA
+  /// APUs) rather than a discrete framebuffer. Read by
+  /// [`Self::recommendations`] for MoE expert-spill placement.
+  pub unified: bool,
+  /// Size of that shared pool, when the host reports one.
+  pub uma_shared_total_bytes: Option<u64>,
 }
 
 impl HardwareFitContext {
@@ -373,6 +400,36 @@ impl HardwareFitContext {
       self.ram_total_bytes,
       self.overhead_band_bytes,
     )
+  }
+
+  /// The ranked picks for these numbers: the same `init::recommender`
+  /// list the `init` wizard and `llamastash recommend` show, so the pull
+  /// dialog and the wizard rank a host the same way from one source of
+  /// truth. Curated rows only — an on-disk row has no HF repo to pull,
+  /// and the escape row would repeat the hint above the list. Empty when
+  /// the backend is unknown or never sampled, so the dialog keeps the
+  /// plain "start typing" hint rather than a list it can't justify.
+  pub fn recommendations(&self, snapshot: &BenchmarkSnapshot) -> Vec<Recommendation> {
+    if self.backend.is_empty() || self.backend == "unknown" {
+      return Vec::new();
+    }
+    let hardware = crate::init::detection::hardware_for_recommender(
+      &crate::init::detection::HostHardwareInputs {
+        backend: self.backend.clone(),
+        vram_bytes: self.vram_bytes,
+        ram_total_bytes: self.ram_total_bytes,
+        unified: self.unified,
+        uma_shared_total_bytes: self.uma_shared_total_bytes,
+      },
+    );
+    let options = RecommendOptions {
+      ctx: self.ctx_tokens,
+      ..Default::default()
+    };
+    crate::init::recommender::recommend(snapshot, &hardware, &[], &options)
+      .into_iter()
+      .filter(|rec| matches!(rec.kind, RecommendationKind::Curated { .. }))
+      .collect()
   }
 }
 
@@ -403,6 +460,8 @@ impl HfDialogState {
       confirm_row: None,
       offline,
       hardware_fit_ctx,
+      recs: Vec::new(),
+      recommended_quant: None,
     }
   }
 
@@ -419,6 +478,22 @@ impl HfDialogState {
       self.query_seq = self.query_seq.saturating_add(1);
       self.last_keystroke_at = Instant::now();
       self.error = None;
+      if self.input.buffer().is_empty() {
+        // Back to the recommendation list, so start its cursor at the top, and
+        // drop the last query's rows: no new search dispatches for an empty
+        // query, so nothing else would clear them. Marking the seq dispatched
+        // also discards a search still in flight, which would otherwise refill
+        // the empty field. Under `Trending` an empty query is a real search.
+        self.selected_idx = 0;
+        if self.sort != HfSortKey::Trending {
+          self.results.clear();
+          self.next_cursor = None;
+          self.prev_cursors.clear();
+          self.page = 1;
+          self.search_in_flight = false;
+          self.last_dispatched_seq = self.query_seq;
+        }
+      }
     }
     outcome
   }
@@ -539,7 +614,7 @@ impl HfDialogState {
   pub fn move_down(&mut self) {
     match self.stage {
       HfStage::Search => {
-        if !self.results.is_empty() && self.selected_idx + 1 < self.results.len() {
+        if self.selected_idx + 1 < self.search_row_count() {
           self.selected_idx += 1;
         }
       }
@@ -555,6 +630,38 @@ impl HfDialogState {
         }
       }
       HfStage::Confirm => {}
+    }
+  }
+
+  /// `true` when the Search stage lists `recs` instead of HF results: an
+  /// empty query with nothing on screen, which is what a freshly opened
+  /// dialog shows. Under the Trending sort an empty query does return HF
+  /// rows, and those stay on screen rather than being replaced.
+  pub fn shows_recommendations(&self) -> bool {
+    self.stage == HfStage::Search && self.query().trim().is_empty() && self.results.is_empty()
+  }
+
+  /// Rows the Search cursor walks right now: the recommendations while
+  /// the field is empty, the HF results otherwise.
+  fn search_row_count(&self) -> usize {
+    if self.shows_recommendations() {
+      self.recs.len()
+    } else {
+      self.results.len()
+    }
+  }
+
+  /// Rebuild the ranking and the fit band from a fresher snapshot. The new
+  /// ranking reorders rows, so the cursor is pulled back inside the list, and
+  /// only while the recommendations are what's on screen — in the Files stage
+  /// the same field walks files.
+  pub fn apply_snapshot(&mut self, ctx: HardwareFitContext, snapshot: &BenchmarkSnapshot) {
+    self.hardware_fit_ctx = ctx;
+    self.recs = self.hardware_fit_ctx.recommendations(snapshot);
+    if self.shows_recommendations() {
+      self.selected_idx = self
+        .selected_idx
+        .min(self.search_row_count().saturating_sub(1));
     }
   }
 
@@ -610,20 +717,26 @@ impl HfDialogState {
   /// should spawn `list_repo_files` against. Honours the
   /// slug-shortcut: if the query buffer parses as an
   /// `owner/repo[:filename]` RepoSpec, that wins over the selected
-  /// search-result row.
+  /// search-result row. With an empty query the cursor is over a
+  /// recommendation row, whose quant is carried into the picker as the
+  /// preselect.
   pub fn submit_search(&mut self) -> Option<String> {
     let slug = RepoSpec::parse(self.input.buffer().trim()).ok();
-    let repo_id = if let Some(spec) = slug {
-      spec.repo_id
+    let picked = if let Some(spec) = slug {
+      (spec.repo_id, None)
+    } else if self.shows_recommendations() {
+      let (repo, quant) = self.recs.get(self.selected_idx).and_then(curated_target)?;
+      (repo, Some(quant))
     } else {
-      self.results.get(self.selected_idx)?.repo_id.clone()
+      (self.results.get(self.selected_idx)?.repo_id.clone(), None)
     };
+    self.recommended_quant = picked.1;
     self.stage = HfStage::FilePicker;
-    self.picker_repo_id = Some(repo_id.clone());
+    self.picker_repo_id = Some(picked.0.clone());
     self.picker_rows.clear();
     self.picker_idx = 0;
     self.picker_load = PickerLoad::Loading;
-    Some(repo_id)
+    Some(picked.0)
   }
 
   /// Apply a successful `list_repo_files` response. Filters to
@@ -656,9 +769,20 @@ impl HfDialogState {
     } else {
       collapse_picker_rows(gguf)
     };
-    // Pre-select the first selectable row so an incomplete shard
-    // set doesn't trap the cursor on a non-selectable row.
-    let picker_idx = rows.iter().position(PickerRow::selectable).unwrap_or(0);
+    // Pre-select the row carrying the recommended quant (see
+    // `recommended_quant`); otherwise the first selectable row, so an
+    // incomplete shard set can't trap the cursor where Enter refuses.
+    let wanted = self.recommended_quant.take();
+    let preselect = wanted.as_deref().and_then(|quant| {
+      let names: Vec<String> = rows.iter().flat_map(|row| row.all_filenames()).collect();
+      let hit = crate::init::download::pick_quant_match(&names, quant)?;
+      rows
+        .iter()
+        .position(|row| row.selectable() && row.all_filenames().contains(&hit))
+    });
+    let picker_idx = preselect
+      .or_else(|| rows.iter().position(PickerRow::selectable))
+      .unwrap_or(0);
     self.picker_load = PickerLoad::Ready;
     self.picker_rows = rows;
     self.picker_idx = picker_idx;
@@ -695,6 +819,7 @@ impl HfDialogState {
     self.picker_load = PickerLoad::Idle;
     self.picker_idx = 0;
     self.confirm_row = None;
+    self.recommended_quant = None;
   }
 
   /// Step from Confirm back to FilePicker.
@@ -865,6 +990,10 @@ fn render_search_body(frame: &mut Frame<'_>, area: Rect, state: &HfDialogState, 
     frame.render_widget(err_line, area);
     return;
   }
+  if state.shows_recommendations() {
+    render_recommendations_body(frame, area, state, palette);
+    return;
+  }
   if state.results.is_empty() {
     let message = if state.input.is_empty() {
       "Start typing to search HuggingFace, or paste an owner/repo slug."
@@ -898,6 +1027,174 @@ fn render_search_body(frame: &mut Frame<'_>, area: Rect, state: &HfDialogState, 
       .map(|(idx, r)| render_search_row(idx, idx == state.selected_idx, state.sort, r, palette)),
   );
   frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The empty-query view: the "start typing" hint, plus the recommender's
+/// picks for this host underneath it, so an opened dialog is a starting
+/// point and not an empty box. The rows share the Search cursor with HF
+/// results, so `↑`/`↓`/`Enter` behave the same here.
+fn render_recommendations_body(
+  frame: &mut Frame<'_>,
+  area: Rect,
+  state: &HfDialogState,
+  palette: &Palette,
+) {
+  let chunks = Layout::default()
+    .direction(Direction::Vertical)
+    .constraints([
+      Constraint::Length(2),
+      Constraint::Length(1),
+      Constraint::Min(0),
+    ])
+    .split(area);
+  let note = Paragraph::new(Line::from(Span::styled(
+    RECOMMENDATIONS_NOTE,
+    palette.muted_style(),
+  )))
+  .wrap(Wrap { trim: true });
+  frame.render_widget(note, chunks[0]);
+  frame.render_widget(
+    Paragraph::new(render_recommendation_header(palette)),
+    chunks[1],
+  );
+
+  // The fit column takes whatever the fixed columns leave in the list width.
+  let fit_width = (chunks[2].width as usize)
+    .saturating_sub(2 + REPO_COL + 2 + FMT_COL + 2 + PARAMS_COL + 2 + SIZE_COL + 2 + QUANT_COL + 2)
+    .max(6);
+  let visible = (chunks[2].height as usize).max(1);
+  let scroll_offset = scroll_offset_for(state.selected_idx, state.recs.len(), visible);
+  let lines: Vec<Line<'static>> = state
+    .recs
+    .iter()
+    .enumerate()
+    .skip(scroll_offset)
+    .take(visible)
+    .map(|(idx, rec)| {
+      render_recommendation_row(
+        idx == state.selected_idx,
+        rec,
+        &state.hardware_fit_ctx,
+        fit_width,
+        palette,
+      )
+    })
+    .collect();
+  frame.render_widget(Paragraph::new(lines), chunks[2]);
+}
+
+/// Header for the recommendation table. The first four columns are
+/// [`render_search_header`]'s; the last two carry what a curated row knows and a
+/// search row doesn't — the quant the pick is sized at, and how the download
+/// sits on this host — in place of the `task` column and the sort-dependent
+/// metric a search row fills from its download listing.
+fn render_recommendation_header(palette: &Palette) -> Line<'static> {
+  let style = palette.label_style();
+  Line::from(vec![
+    Span::raw("  "),
+    Span::styled(format!("{:<REPO_COL$}  ", "repo"), style),
+    Span::styled(format!("{:<FMT_COL$}  ", "fmt"), style),
+    Span::styled(format!("{:>PARAMS_COL$}  ", "params"), style),
+    Span::styled(format!("{:>SIZE_COL$}  ", "size"), style),
+    Span::styled(format!("{:<QUANT_COL$}  ", "quant"), style),
+    Span::styled("fit".to_string(), style),
+  ])
+}
+
+/// One curated row in the search table's columns. Repo and download size come
+/// off the catalog entry the way a search row fills them; params, quant and the
+/// fit verdict come off the row's [`crate::init::recommender::RecommendationFacts`], so this table and
+/// `init`'s prose read one set of numbers. The verdict is the file picker's own
+/// glyph for that download, so the row and the file `Enter` preselects agree.
+///
+/// TODO: the size column is the catalog's `weights_bytes`, so a row can list a
+/// model the File picker then marks `✗` for the real file. Tracked in TODO.md.
+fn render_recommendation_row(
+  selected: bool,
+  rec: &Recommendation,
+  ctx: &HardwareFitContext,
+  fit_width: usize,
+  palette: &Palette,
+) -> Line<'static> {
+  let prefix = if selected { "▌ " } else { "  " };
+  let mut style = palette.text_style();
+  if selected {
+    style = style.add_modifier(Modifier::REVERSED);
+  }
+  let (repo, size_bytes, params) = match &rec.kind {
+    // The param count comes straight off the entry, formatted the way a search
+    // row formats it. `facts.params` is the recommender's bucket (32B, 70B+),
+    // which belongs in the prose `init` prints, not under a `params` header.
+    RecommendationKind::Curated { entry } => (
+      entry.repo.as_str(),
+      Some(entry.weights_bytes),
+      format_param_count(entry.params),
+    ),
+    // The list filters to curated rows; a foreign row keeps the columns
+    // aligned and shows nothing.
+    _ => ("", None, "-".to_string()),
+  };
+  let facts = rec.facts.clone().unwrap_or_default();
+  let params = crate::tui::fmt::truncate_end(&params, PARAMS_COL);
+  let size = match size_bytes {
+    Some(bytes) => crate::tui::fmt::format_bytes(bytes),
+    None => "-".to_string(),
+  };
+  let quant = if facts.quant.is_empty() {
+    "-".to_string()
+  } else {
+    crate::tui::fmt::truncate_end(&facts.quant, QUANT_COL)
+  };
+  let fit = match facts.spill_percent {
+    // An offloaded MoE sits above VRAM on purpose, so the picker's verdict for
+    // its file (`oversize`) would read as a contradiction. Name what makes it
+    // runnable instead.
+    Some(pct) => format!("{} spill ~{pct}%", FileFit::Tight.glyph()),
+    None => {
+      let fit = ctx.fit_for(size_bytes);
+      format!("{} {}", fit.glyph(), fit.word())
+    }
+  };
+  Line::from(vec![
+    Span::styled(
+      format!(
+        "{prefix}{:<col$}  ",
+        crate::tui::fmt::truncate_end(repo, REPO_COL),
+        col = REPO_COL
+      ),
+      style,
+    ),
+    Span::styled(format!("{:<FMT_COL$}  ", "GGUF"), style),
+    Span::styled(format!("{params:>PARAMS_COL$}  "), style),
+    Span::styled(format!("{size:>SIZE_COL$}  "), style),
+    Span::styled(format!("{quant:<QUANT_COL$}  "), style),
+    Span::styled(crate::tui::fmt::truncate_end(&fit, fit_width), style),
+  ])
+}
+
+/// `(GGUF repo, quant)` a curated row opens in the File picker, or `None`
+/// for the row kinds the pull dialog never lists (on-disk, escape).
+///
+/// A `synthetic`-publisher row names the upstream safetensors repo and a
+/// GGUF file the snapshot invents for each quant, which no publisher
+/// hosts. Opening that repo would offer a whole-repo safetensors pull the
+/// default backend cannot serve, so the row opens the first community GGUF
+/// mirror instead — the head of the same fallback chain `init` walks — and
+/// matches the quant instead of a file name that only exists in the
+/// snapshot.
+fn curated_target(rec: &Recommendation) -> Option<(String, String)> {
+  let RecommendationKind::Curated { entry } = &rec.kind else {
+    return None;
+  };
+  let repo = if entry.gguf_publisher == "synthetic" {
+    crate::init::download::synthetic_publisher_fallbacks(&entry.repo)
+      .into_iter()
+      .next()
+      .unwrap_or_else(|| entry.repo.clone())
+  } else {
+    entry.repo.clone()
+  };
+  Some((repo, entry.quant.clone()))
 }
 
 /// Pure scroll-window math: given a selected row index, a total row
@@ -962,19 +1259,40 @@ fn render_search_row(
   Line::from(vec![
     Span::styled(prefix.to_string(), style),
     Span::styled(
-      format!("{:<36}  ", crate::tui::fmt::truncate_end(&r.repo_id, 36)),
+      format!(
+        "{:<col$}  ",
+        crate::tui::fmt::truncate_end(&r.repo_id, REPO_COL),
+        col = REPO_COL
+      ),
       style,
     ),
-    Span::styled(format!("{:<4}  ", r.weight_format().label()), style),
-    Span::styled(format!("{params:>6}  "), style),
-    Span::styled(format!("{size:>6}  "), style),
+    Span::styled(format!("{:<FMT_COL$}  ", r.weight_format().label()), style),
+    Span::styled(format!("{params:>PARAMS_COL$}  "), style),
+    Span::styled(format!("{size:>SIZE_COL$}  "), style),
     Span::styled(
-      format!("{:<16}  ", crate::tui::fmt::truncate_end(&tag, 16)),
+      format!(
+        "{:<col$}  ",
+        crate::tui::fmt::truncate_end(&tag, TRAILING_COL),
+        col = TRAILING_COL
+      ),
       palette.muted_style(),
     ),
     Span::styled(metric, palette.label_style()),
   ])
 }
+
+/// Column widths shared by the search and recommendation tables, so both put
+/// repo, format, params and size under the same header cells. The variable
+/// column (`TRAILING_COL`) carries the sort-dependent metric on a search row and
+/// the fit verdict on a recommendation row.
+const REPO_COL: usize = 36;
+const FMT_COL: usize = 4;
+const PARAMS_COL: usize = 6;
+const SIZE_COL: usize = 6;
+const TRAILING_COL: usize = 16;
+
+/// Width of the quant column, which only a recommendation row fills.
+const QUANT_COL: usize = 8;
 
 /// Column header for the search results, aligned to
 /// [`render_search_row`]'s widths. The active sort's column is
@@ -985,19 +1303,19 @@ fn render_search_header(sort: HfSortKey, palette: &Palette) -> Line<'static> {
   let col_style = |on: bool| if on { active } else { label };
   Line::from(vec![
     Span::styled(
-      format!("  {:<36}  ", "repo"),
+      format!("  {:<REPO_COL$}  ", "repo"),
       col_style(sort == HfSortKey::RepoName),
     ),
-    Span::styled(format!("{:<4}  ", "fmt"), label),
+    Span::styled(format!("{:<FMT_COL$}  ", "fmt"), label),
     Span::styled(
-      format!("{:>6}  ", "params"),
+      format!("{:>PARAMS_COL$}  ", "params"),
       col_style(sort == HfSortKey::ParamSize),
     ),
     Span::styled(
-      format!("{:>6}  ", "size"),
+      format!("{:>SIZE_COL$}  ", "size"),
       col_style(sort == HfSortKey::FileSize),
     ),
-    Span::styled(format!("{:<16}  ", "task"), label),
+    Span::styled(format!("{:<TRAILING_COL$}  ", "task"), label),
   ])
 }
 
@@ -1053,11 +1371,17 @@ fn render_picker_body(
       lines.push(Line::from(vec![
         Span::styled("fit:  ", palette.label_style()),
         Span::styled(FileFit::Fit.glyph(), palette.success_style()),
-        Span::styled(" fits  ", palette.muted_style()),
+        Span::styled(format!(" {}  ", FileFit::Fit.word()), palette.muted_style()),
         Span::styled(FileFit::Tight.glyph(), palette.warning_style()),
-        Span::styled(" tight  ", palette.muted_style()),
+        Span::styled(
+          format!(" {}  ", FileFit::Tight.word()),
+          palette.muted_style(),
+        ),
         Span::styled(FileFit::Over.glyph(), palette.error_style()),
-        Span::styled(" oversize  ", palette.muted_style()),
+        Span::styled(
+          format!(" {}  ", FileFit::Over.word()),
+          palette.muted_style(),
+        ),
         Span::styled(FileFit::Unknown.glyph(), palette.muted_style()),
         Span::styled(" unknown", palette.muted_style()),
       ]));
@@ -1255,6 +1579,19 @@ mod tests {
   }
   use super::*;
   use std::time::Duration;
+
+  /// Land a search page the way the event drain would, so tests can put rows on
+  /// screen without a network task.
+  fn seed_results(state: &mut HfDialogState, repos: &[&str]) {
+    state.mark_dispatched();
+    state.apply_search_results(
+      state.last_dispatched_seq,
+      HfSearchPage {
+        results: repos.iter().map(|id| fake_result(id)).collect(),
+        next_cursor: None,
+      },
+    );
+  }
 
   fn type_query(state: &mut HfDialogState, text: &str) {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1771,6 +2108,7 @@ mod tests {
       ram_total_bytes: 32 * 1024 * 1024 * 1024,
       overhead_band_bytes: Some(512 * 1024 * 1024),
       ctx_tokens: crate::init::recommender::DEFAULT_CTX,
+      ..Default::default()
     };
     // Small file → Fit.
     assert_eq!(ctx.fit_for(Some(4 * 1024 * 1024 * 1024)), FileFit::Fit);
@@ -1778,6 +2116,209 @@ mod tests {
     assert_eq!(ctx.fit_for(Some(30 * 1024 * 1024 * 1024)), FileFit::Over);
     // None size → Unknown.
     assert_eq!(ctx.fit_for(None), FileFit::Unknown);
+  }
+
+  /// A dialog opened on a 24 GiB CUDA host, so `recs` holds the real
+  /// bundled-snapshot ranking for that box.
+  fn state_with_recommendations() -> HfDialogState {
+    let ctx = HardwareFitContext {
+      backend: "cuda".into(),
+      vram_bytes: Some(24 * 1024 * 1024 * 1024),
+      ram_total_bytes: 64 * 1024 * 1024 * 1024,
+      ctx_tokens: crate::init::recommender::DEFAULT_CTX,
+      ..Default::default()
+    };
+    let snapshot = crate::init::benchmark::load_bundled();
+    let mut s = HfDialogState::open(false, ctx.clone());
+    s.recs = s.hardware_fit_ctx.recommendations(&snapshot);
+    s
+  }
+
+  #[test]
+  fn a_snapshot_refresh_pulls_the_cursor_back_inside_the_new_list() {
+    let snapshot = crate::init::benchmark::load_bundled();
+    let ctx = HardwareFitContext {
+      backend: "cuda".into(),
+      vram_bytes: Some(24 * 1024 * 1024 * 1024),
+      ram_total_bytes: 64 * 1024 * 1024 * 1024,
+      ctx_tokens: crate::init::recommender::DEFAULT_CTX,
+      ..Default::default()
+    };
+    let mut state = HfDialogState::open(true, ctx.clone());
+    state.recs = ctx.recommendations(&snapshot);
+    assert!(
+      state.recs.len() > 2,
+      "the bundled catalog gives a 24 GiB host several picks"
+    );
+    state.selected_idx = state.recs.len() - 1;
+
+    let mut fresh = crate::init::benchmark::load_bundled();
+    fresh.models.retain(|e| e.repo == "Qwen/Qwen3-4B");
+    state.apply_snapshot(ctx, &fresh);
+    assert!(
+      state.selected_idx < state.recs.len(),
+      "a shorter list cannot leave the cursor past its end",
+    );
+  }
+
+  #[test]
+  fn recommendations_are_curated_only_and_follow_the_host() {
+    let snapshot = crate::init::benchmark::load_bundled();
+    let big = HardwareFitContext {
+      backend: "cuda".into(),
+      vram_bytes: Some(24 * 1024 * 1024 * 1024),
+      ram_total_bytes: 64 * 1024 * 1024 * 1024,
+      ctx_tokens: crate::init::recommender::DEFAULT_CTX,
+      ..Default::default()
+    };
+    let recs = big.recommendations(&snapshot);
+    assert!(!recs.is_empty(), "a 24 GiB CUDA host must get picks");
+    assert!(
+      recs
+        .iter()
+        .all(|r| matches!(r.kind, RecommendationKind::Curated { .. })),
+      "on-disk and escape rows have no HF repo to pull",
+    );
+    // The row's numbers arrive as fields, which is what the table lays out, and
+    // prose() is the same facts as the sentence `init` prints.
+    for rec in &recs {
+      let facts = rec.facts.clone().unwrap();
+      assert!(
+        !facts.params.is_empty() && !facts.quant.is_empty() && facts.peak_bytes > 0,
+        "every curated row carries the fields the table reads: {facts:?}",
+      );
+      let prose = rec.prose();
+      assert!(
+        prose.contains(&facts.quant) && prose.contains(&facts.host_total),
+        "the prose line renders those same facts: {prose}",
+      );
+    }
+    // A much smaller box can't run the big entries, so its list differs.
+    let small = HardwareFitContext {
+      vram_bytes: Some(4 * 1024 * 1024 * 1024),
+      ..big
+    };
+    assert_ne!(
+      small.recommendations(&snapshot).first().map(|r| r.score),
+      recs.first().map(|r| r.score),
+      "the ranking has to track the host's memory",
+    );
+    // An unknown backend says nothing rather than guessing.
+    let unknown = HardwareFitContext {
+      backend: "unknown".into(),
+      ..Default::default()
+    };
+    assert!(unknown.recommendations(&snapshot).is_empty());
+  }
+
+  #[test]
+  fn the_empty_query_shows_recommendations_and_the_cursor_walks_them() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut s = state_with_recommendations();
+    let n = s.recs.len();
+    assert!(s.shows_recommendations());
+    for _ in 0..n + 3 {
+      s.move_down();
+    }
+    assert_eq!(s.selected_idx, n - 1, "cursor clamps at the last pick");
+    s.move_up();
+    assert_eq!(s.selected_idx, n - 2);
+
+    type_query(&mut s, "qwen");
+    seed_results(&mut s, &["qwen/one", "qwen/two"]);
+    assert!(!s.shows_recommendations(), "a typed query owns the view");
+    s.selected_idx = 1;
+    for _ in 0..4 {
+      s.handle_search_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    }
+    assert!(s.shows_recommendations(), "clearing returns to the picks");
+    assert_eq!(s.selected_idx, 0, "the cursor restarts at the top");
+  }
+
+  #[test]
+  fn clearing_the_query_drops_the_results_and_a_search_still_in_flight() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut s = state_with_recommendations();
+    type_query(&mut s, "qwen");
+    seed_results(&mut s, &["qwen/typed"]);
+    // A second query goes out; the field is cleared before its response lands.
+    type_query(&mut s, "-gpt");
+    s.mark_dispatched();
+    let in_flight = s.last_dispatched_seq;
+    for _ in 0..s.query().chars().count() {
+      s.handle_search_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    }
+    assert!(s.query().is_empty());
+    assert!(
+      s.shows_recommendations() && s.results.is_empty(),
+      "the picks come back with the field empty",
+    );
+    assert!(
+      !s.search_in_flight,
+      "the dialog stops waiting for the dead query"
+    );
+    s.apply_search_results(
+      in_flight,
+      HfSearchPage {
+        results: vec![fake_result("late/gpt")],
+        next_cursor: None,
+      },
+    );
+    assert!(
+      s.results.is_empty(),
+      "a late response cannot refill a field the user already cleared",
+    );
+    assert!(s.shows_recommendations());
+  }
+
+  #[test]
+  fn enter_on_a_recommendation_opens_a_gguf_repo_and_preselects_the_quant() {
+    let mut s = state_with_recommendations();
+    // The bundled list is mostly `synthetic` rows, whose repo is the
+    // upstream safetensors repo, so index 2 exercises the mirror path.
+    s.selected_idx = 2;
+    let (quant, upstream, synthetic) = match &s.recs[2].kind {
+      RecommendationKind::Curated { entry } => (
+        entry.quant.clone(),
+        entry.repo.clone(),
+        entry.gguf_publisher == "synthetic",
+      ),
+      _ => panic!("expected a curated pick at index 2"),
+    };
+    let repo = s.submit_search().expect("a curated pick opens a repo");
+    if synthetic {
+      let mirrors = crate::init::download::synthetic_publisher_fallbacks(&upstream);
+      assert_eq!(Some(repo.as_str()), mirrors.first().map(String::as_str));
+    } else {
+      assert_eq!(repo, upstream);
+    }
+    assert_eq!(s.picker_repo_id.as_deref(), Some(repo.as_str()));
+    assert_eq!(s.recommended_quant.as_deref(), Some(quant.as_str()));
+    assert_eq!(s.stage, HfStage::FilePicker);
+
+    // The picker lands on the row carrying that quant, not just the first.
+    let wanted = format!("model-{quant}.gguf");
+    s.apply_repo_files(
+      &repo,
+      vec![file("model-bogus.gguf", Some(1)), file(&wanted, Some(2))],
+    );
+    assert_eq!(s.picker_idx, 1, "the recommended quant is preselected");
+
+    // A repo without it falls back to the first selectable row.
+    s.recommended_quant = Some(quant.clone());
+    s.apply_repo_files(&repo, vec![file("model-bogus.gguf", Some(1))]);
+    assert_eq!(s.picker_idx, 0);
+    assert!(s.recommended_quant.is_none(), "the hint is consumed once");
+  }
+
+  #[test]
+  fn a_query_with_results_submits_the_result_row_not_a_recommendation() {
+    let mut s = state_with_recommendations();
+    type_query(&mut s, "qwen");
+    s.results = vec![fake_result("someone/Qwen-Thing")];
+    s.selected_idx = 0;
+    assert_eq!(s.submit_search().as_deref(), Some("someone/Qwen-Thing"));
+    assert!(s.recommended_quant.is_none(), "nothing to preselect");
   }
 
   #[test]

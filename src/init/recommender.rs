@@ -57,6 +57,58 @@ pub const DEFAULT_TOP_N: usize = 10;
 /// halve → quant down → skip).
 pub const DEFAULT_CTX: u32 = 16384;
 
+/// The standing invitation appended as the last row of every list, so a user
+/// who knows what they want never has to argue with the ranking.
+pub const ESCAPE_NOTE: &str = "Paste an HF repo id to download something not on this list";
+
+/// What one recommendation asserts about this host, as fields a table can lay
+/// out. [`RecommendationFacts::prose`] renders the same numbers as the
+/// one-line sentence `init` prints (R58), so a table view and the wizard's
+/// prose read one set of values and cannot drift.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RecommendationFacts {
+  /// Params bucket label (e.g. `32B`). Empty for an on-disk row.
+  pub params: String,
+  /// Quant tag (e.g. `Q4_K_M`). Empty for an on-disk row.
+  pub quant: String,
+  /// File name of a model already on disk; `Some` only for an on-disk row.
+  pub disk_file: Option<String>,
+  /// Estimated peak memory at the context the list was built for.
+  pub peak_bytes: u64,
+  /// The pool `peak_bytes` sits inside: `24.0 GiB VRAM`, or `64.0 GiB RAM`
+  /// when there is no GPU to size against.
+  pub host_total: String,
+  /// Benchmark term (e.g. `79 on whichllm`). Empty when the row has no score.
+  pub bench: String,
+  /// MoE expert spill: percent of `peak_bytes` the launcher would keep in
+  /// system RAM. `None` when the pick fits the GPU outright.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub spill_percent: Option<u32>,
+}
+
+impl RecommendationFacts {
+  /// The prose form of these facts: `init`'s one-line justification (R58).
+  /// The only place that sentence is assembled.
+  pub fn prose(&self) -> String {
+    let subject = match &self.disk_file {
+      Some(name) => format!("[on disk] {name}"),
+      None => format!("{} {}", self.params, self.quant),
+    };
+    let mut line = format!(
+      "{subject} · ~{} ({})",
+      format_gib(self.peak_bytes),
+      self.host_total
+    );
+    if !self.bench.is_empty() {
+      line.push_str(&format!(" · {}", self.bench));
+    }
+    if let Some(pct) = self.spill_percent {
+      line.push_str(&format!(" · experts in RAM ~{pct}%"));
+    }
+    line
+  }
+}
+
 /// One row in the output list. The wizard renders these in order,
 /// with the escape row pinned to the end.
 #[derive(Debug, Clone, Serialize)]
@@ -65,12 +117,20 @@ pub struct Recommendation {
   /// Composite ranker score (higher = better). The escape row carries
   /// `score = -inf` so it always sorts last regardless of input order.
   pub score: f32,
-  /// One-line summary the wizard prints next to the prompt. Built
-  /// from [`render_one_line`] when `kind` is a real model.
-  pub justification: String,
-  /// Estimated peak memory at the configured ctx. `None` for the
-  /// escape row.
-  pub estimated_peak_bytes: Option<u64>,
+  /// The numbers behind the row, `None` for the escape row, which asserts
+  /// nothing about the hardware.
+  pub facts: Option<RecommendationFacts>,
+}
+
+impl Recommendation {
+  /// The one-line summary shown next to a row: the row's facts as a sentence,
+  /// or the escape row's standing invitation.
+  pub fn prose(&self) -> String {
+    match &self.facts {
+      Some(facts) => facts.prose(),
+      None => ESCAPE_NOTE.to_string(),
+    }
+  }
 }
 
 // `large_enum_variant`: ModelEntry is ~272 bytes after the
@@ -146,19 +206,28 @@ pub fn recommend(
       continue;
     };
     let mut score = composite_score(entry, snapshot, options);
-    let mut justification = render_one_line(entry, peak, hardware);
+    let spill_percent = (offload_ratio > 0.0).then(|| (offload_ratio * 100.0).round() as u32);
     if offload_ratio > 0.0 {
       let bench = snapshot.recommender_weights.benchmark * entry.benchmark_score.value / 100.0;
       score -= bench * (1.0 - offload_quality_factor(entry, offload_ratio));
-      justification.push_str(&format!(" · experts in RAM ~{:.0}%", offload_ratio * 100.0));
     }
     scored.push(Recommendation {
       kind: RecommendationKind::Curated {
         entry: entry.clone(),
       },
       score,
-      justification,
-      estimated_peak_bytes: Some(peak),
+      facts: Some(RecommendationFacts {
+        params: format_params(entry.params).to_string(),
+        quant: entry.quant.clone(),
+        disk_file: None,
+        peak_bytes: peak,
+        host_total: host_total_label(hardware),
+        bench: format!(
+          "{:.0} on {}",
+          entry.benchmark_score.value, entry.benchmark_score.source
+        ),
+        spill_percent,
+      }),
     });
   }
   for disk in on_disk {
@@ -177,8 +246,15 @@ pub fn recommend(
         weights_bytes: disk.weights_bytes,
       },
       score: score + ON_DISK_TIE_BREAK,
-      justification: render_on_disk_one_line(disk, peak, hardware),
-      estimated_peak_bytes: Some(peak),
+      facts: Some(RecommendationFacts {
+        params: String::new(),
+        quant: String::new(),
+        disk_file: Some(disk_file_label(disk)),
+        peak_bytes: peak,
+        host_total: host_total_label(hardware),
+        bench: String::new(),
+        spill_percent: None,
+      }),
     });
   }
   // Stable sort by score descending — ties keep input order, which
@@ -211,8 +287,7 @@ pub fn recommend(
   scored.push(Recommendation {
     kind: RecommendationKind::Escape,
     score: f32::NEG_INFINITY,
-    justification: "Paste an HF repo id to download something not on this list".to_string(),
-    estimated_peak_bytes: None,
+    facts: None,
   });
   scored
 }
@@ -537,6 +612,16 @@ impl FileFit {
   /// `Unknown` returns an em-dash `—` (R113 — the picker keeps the
   /// fit column width stable across rows; a blank slot would shift
   /// the rest of the line when the sampler is still warming up).
+  /// The verdict as a word, for a column or legend that spells it out.
+  pub fn word(self) -> &'static str {
+    match self {
+      FileFit::Fit => "fits",
+      FileFit::Tight => "tight",
+      FileFit::Over => "oversize",
+      FileFit::Unknown => "unknown",
+    }
+  }
+
   pub fn glyph(self) -> &'static str {
     match self {
       FileFit::Fit => "✓",
@@ -630,35 +715,24 @@ fn on_disk_score(
   composite_score(&fake_entry, snapshot, options)
 }
 
-/// One-line justification rendered next to the prompt. Anchored
-/// around "fits N GB · ~X t/s · YB ZK". The wizard's `?` toggle
-/// shows the full breakdown.
-pub fn render_one_line(entry: &ModelEntry, peak_bytes: u64, hw: &HardwareSnapshot) -> String {
-  let fit = format_gib(peak_bytes);
-  let total = match hw.vram_bytes {
+/// The pool a pick is sized against: the GPU's memory when there is one,
+/// else system RAM. Read by [`RecommendationFacts::prose`] and by anything
+/// that wants the number without rebuilding a sentence out of it.
+fn host_total_label(hw: &HardwareSnapshot) -> String {
+  match hw.vram_bytes {
     Some(v) => format!("{} VRAM", format_gib(v)),
     None => format!("{} RAM", format_gib(hw.ram_total_bytes)),
-  };
-  let bench = format!(
-    "{:.0} on {}",
-    entry.benchmark_score.value, entry.benchmark_score.source
-  );
-  let params = format_params(entry.params);
-  format!("{params} {} · ~{fit} ({total}) · {bench}", entry.quant)
+  }
 }
 
-fn render_on_disk_one_line(disk: &OnDiskModel, peak_bytes: u64, hw: &HardwareSnapshot) -> String {
-  let fit = format_gib(peak_bytes);
-  let total = match hw.vram_bytes {
-    Some(v) => format!("{} VRAM", format_gib(v)),
-    None => format!("{} RAM", format_gib(hw.ram_total_bytes)),
-  };
-  let path = disk
+/// File name an on-disk row shows, or `local model` when the path has none.
+fn disk_file_label(disk: &OnDiskModel) -> String {
+  disk
     .path
     .file_name()
-    .and_then(|n| n.to_str())
-    .unwrap_or("local model");
-  format!("[on disk] {path} · ~{fit} ({total})")
+    .and_then(|s| s.to_str())
+    .unwrap_or("local model")
+    .to_string()
 }
 
 fn format_gib(bytes: u64) -> String {
@@ -839,6 +913,11 @@ mod tests {
     );
   }
 
+  /// The peak memory a row asserts, for the fit-contract assertions below.
+  fn peak_of(rec: &Recommendation) -> Option<u64> {
+    rec.facts.as_ref().map(|f| f.peak_bytes)
+  }
+
   #[test]
   fn recommend_8gb_nvidia_fits_vram_or_spills_moe_experts() {
     // Every pick either fits the 8 GB ceiling, or is a MoE whose experts
@@ -848,15 +927,16 @@ mod tests {
     let ceiling = effective_vram_ceiling(&hw, &snap);
     let recs = recommend(&snap, &hw, &[], &RecommendOptions::default());
     for rec in &recs {
-      if let (RecommendationKind::Curated { entry }, Some(peak)) =
-        (&rec.kind, rec.estimated_peak_bytes)
-      {
+      if let (RecommendationKind::Curated { entry }, Some(peak)) = (&rec.kind, peak_of(rec)) {
         if peak <= ceiling {
           continue;
         }
         assert!(
           entry.is_moe
-            && rec.justification.contains("experts in RAM")
+            && rec
+              .facts
+              .as_ref()
+              .is_some_and(|f| f.spill_percent.is_some())
             && peak <= ceiling + offload_ram_budget(hw.ram_total_bytes),
           "{}: peak={peak} over ceiling={ceiling} without a MoE spill",
           entry.id
@@ -880,9 +960,7 @@ mod tests {
       .count();
     assert!(curated_count > 0, "cpu-only must surface at least one pick");
     for rec in &recs {
-      if let (RecommendationKind::Curated { entry }, Some(peak)) =
-        (&rec.kind, rec.estimated_peak_bytes)
-      {
+      if let (RecommendationKind::Curated { entry }, Some(peak)) = (&rec.kind, peak_of(rec)) {
         assert!(
           peak <= ceiling,
           "cpu-only 16 GB must not surface a model whose peak exceeds the ceiling \

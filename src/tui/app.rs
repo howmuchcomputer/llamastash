@@ -53,6 +53,24 @@ pub const COMPACT_WIDTH_THRESHOLD: u16 = 100;
 /// from the daemon's sampler vocabulary. R113: `"unknown"` and
 /// `"unsampled"` pass through verbatim so `vram_fit_for_file` can
 /// return `FileFit::Unknown`.
+/// VRAM the fit math sizes against: the smallest card the ranked backend can
+/// actually use, which is what `init::detection::aggregate_vram_bytes` does and
+/// what a launch gets. The daemon's `gpu_mem_total_bytes` sums every device, so
+/// a 2x24 GiB box would rank models neither card runs, and a hybrid laptop
+/// would fold the iGPU's memory into the RTX's. Falls back to the sum when the
+/// metrics carry no usable device rows.
+fn ranked_vram_bytes(metrics: &HostMetricsSnapshot, backend: &str) -> Option<u64> {
+  let devices = metrics.gpu_devices.as_deref().unwrap_or(&[]);
+  let multi = metrics.gpu_backend == HostMetricsSnapshot::BACKEND_MULTI;
+  let smallest = devices
+    .iter()
+    .filter(|d| !multi || recommender_backend_key(&d.backend) == backend)
+    .map(|d| d.total_memory_bytes)
+    .filter(|&bytes| bytes > 0)
+    .min();
+  smallest.or(metrics.gpu_mem_total_bytes)
+}
+
 fn recommender_backend_key(wire: &str) -> &'static str {
   use crate::daemon::host_metrics::HostMetricsSnapshot as H;
   match wire {
@@ -64,6 +82,21 @@ fn recommender_backend_key(wire: &str) -> &'static str {
     // `FileFit::Unknown` rather than fake confidence.
     H::BACKEND_UNKNOWN => "unknown",
     _ => "unknown",
+  }
+}
+
+/// Backend key for a `multi`-backend host, which the wire label alone cannot
+/// answer: pick from the devices the sampler found, in the CUDA > ROCm >
+/// Vulkan order `init`'s VRAM ceiling uses, so a hybrid laptop ranks against
+/// the card that will run the model instead of reporting no usable backend.
+fn multi_recommender_backend(devices: &[crate::daemon::host_metrics::DeviceRow]) -> &'static str {
+  use crate::daemon::host_metrics::HostMetricsSnapshot as H;
+  if devices.iter().any(|d| d.backend == H::BACKEND_NVIDIA) {
+    "cuda"
+  } else if devices.iter().any(|d| d.backend == H::BACKEND_AMD) {
+    "hip"
+  } else {
+    "unknown"
   }
 }
 
@@ -465,6 +498,11 @@ pub struct App {
   /// is open; the input pump routes through `Focus::HfDialog` to the
   /// per-stage key handler.
   pub hf_dialog: Option<crate::tui::hf_dialog::HfDialogState>,
+  /// Benchmark snapshot newer than the one compiled into the binary, once the
+  /// dialog's one background refresh brings one in. Cached for the session so
+  /// every later dialog open ranks from it without another fetch; `None` keeps
+  /// the bundled copy as the source.
+  pub hf_snapshot: Option<crate::init::benchmark::BenchmarkSnapshot>,
   /// `Ctrl+P` save-preset dialog. `Some(_)` while the modal is open; the
   /// input pump routes keys to its name / overwrite stages.
   pub save_preset_dialog: Option<crate::tui::save_preset_dialog::SavePresetDialog>,
@@ -670,6 +708,7 @@ impl App {
       daemon_start_error: None,
       daemon_info: DaemonInfo::default(),
       host_metrics: HostMetricsSnapshot::default(),
+      hf_snapshot: None,
       servers: Vec::new(),
       should_exit: false,
       quit_confirm: false,
@@ -725,9 +764,22 @@ impl App {
   /// fetch tasks short-circuit before any HF traffic.
   pub fn open_hf_dialog(&mut self) {
     if self.hf_dialog.is_none() {
-      let ctx = self.hf_hardware_fit_ctx();
+      // One snapshot read for both the fit band and the recommendation
+      // ranking, so opening the dialog parses it once. The bundled copy ranks
+      // immediately; the remote tier `init` ranks against arrives behind the
+      // same event channel the HF search uses, if it is newer.
       let offline = self.options.offline || crate::init::fetch::offline_requested(false);
-      self.hf_dialog = Some(crate::tui::hf_dialog::HfDialogState::open(offline, ctx));
+      let snapshot = self
+        .hf_snapshot
+        .clone()
+        .unwrap_or_else(crate::init::benchmark::load_bundled);
+      let ctx = self.hf_hardware_fit_ctx(&snapshot);
+      let mut state = crate::tui::hf_dialog::HfDialogState::open(offline, ctx);
+      state.recs = state.hardware_fit_ctx.recommendations(&snapshot);
+      self.hf_dialog = Some(state);
+      if self.hf_snapshot.is_none() && !offline {
+        crate::tui::hf_pull::spawn_hf_snapshot_refresh(offline, self.events_tx.clone());
+      }
     }
     self.focus = Focus::HfDialog;
   }
@@ -736,12 +788,35 @@ impl App {
   /// state at open time. Backend / VRAM / RAM come from the
   /// daemon's host-metrics sampler; the per-backend overhead band
   /// is read from the bundled benchmark snapshot. R111 + R113.
-  fn hf_hardware_fit_ctx(&self) -> crate::tui::hf_dialog::HardwareFitContext {
+  pub(crate) fn hf_hardware_fit_ctx(
+    &self,
+    snapshot: &crate::init::benchmark::BenchmarkSnapshot,
+  ) -> crate::tui::hf_dialog::HardwareFitContext {
     use crate::tui::hf_dialog::HardwareFitContext;
-    let backend = recommender_backend_key(&self.host_metrics.gpu_backend);
-    let vram_bytes = self.host_metrics.gpu_mem_total_bytes;
+    let wire = self.host_metrics.gpu_backend.as_str();
+    let backend = match wire {
+      crate::daemon::host_metrics::HostMetricsSnapshot::BACKEND_MULTI => {
+        multi_recommender_backend(self.host_metrics.gpu_devices.as_deref().unwrap_or(&[]))
+      }
+      _ => recommender_backend_key(wire),
+    };
+    let vram_bytes = ranked_vram_bytes(&self.host_metrics, backend);
+    // `unified` is a host verdict and a hybrid laptop earns it from the iGPU's
+    // UMA marker, even though the card we ranked for is discrete. shortcut: a
+    // host whose only accelerator is a unified AMD APU also lands in `multi`
+    // when a second enumeration splits it, and then ranking it as discrete
+    // lets expert spill into memory that is the same pool as VRAM. Upgrade by
+    // carrying a per-device UMA marker over IPC.
+    let discrete_on_multi = wire == crate::daemon::host_metrics::HostMetricsSnapshot::BACKEND_MULTI
+      && matches!(backend, "cuda" | "hip");
+    let unified = self.host_metrics.unified && !discrete_on_multi;
+    let uma_shared_total_bytes = if unified {
+      self.host_metrics.uma_shared_total_bytes
+    } else {
+      None
+    };
     let ram_total_bytes = self.host_metrics.ram_total_bytes;
-    let overhead_band_bytes = crate::init::benchmark::load_bundled()
+    let overhead_band_bytes = snapshot
       .recommender_weights
       .overhead_band_bytes
       .get(backend)
@@ -752,6 +827,8 @@ impl App {
       ram_total_bytes,
       overhead_band_bytes,
       ctx_tokens: crate::init::recommender::DEFAULT_CTX,
+      unified,
+      uma_shared_total_bytes,
     }
   }
 
@@ -3248,6 +3325,160 @@ mod tests {
     assert_eq!(app.host_metrics.gpu_backend, "nvidia");
     assert_eq!(app.host_metrics.ram_total_bytes, 17_179_869_184);
     assert_eq!(app.host_metrics.gpu_util_pct, Some(84.0));
+  }
+
+  #[test]
+  fn opening_the_hf_dialog_ranks_the_host_and_picks_up_a_multi_backend_card() {
+    use crate::daemon::host_metrics::DeviceRow;
+    let mut app = App::new(AppOptions::default());
+    // A hybrid laptop: the wire label is `multi`, and the only card worth
+    // ranking against is the NVIDIA one (the Vulkan row is an iGPU with no
+    // memory of its own).
+    app.host_metrics = HostMetricsSnapshot {
+      gpu_backend: HostMetricsSnapshot::BACKEND_MULTI.into(),
+      gpu_mem_total_bytes: Some(4 * 1024 * 1024 * 1024),
+      ram_total_bytes: 32 * 1024 * 1024 * 1024,
+      gpu_device_count: 2,
+      gpu_devices: Some(vec![
+        DeviceRow {
+          selector: "Nvidia0".into(),
+          backend: "nvidia".into(),
+          name: "RTX 3050 Ti".into(),
+          total_memory_bytes: 4 * 1024 * 1024 * 1024,
+          used_memory_bytes: None,
+          utilization_pct: None,
+          temperature_c: None,
+        },
+        DeviceRow {
+          selector: "Vulkan1".into(),
+          backend: "unknown".into(),
+          name: "Intel UHD".into(),
+          total_memory_bytes: 0,
+          used_memory_bytes: None,
+          utilization_pct: None,
+          temperature_c: None,
+        },
+      ]),
+      ..Default::default()
+    };
+    app.open_hf_dialog();
+    let dialog = app.hf_dialog.expect("dialog opens");
+    assert_eq!(dialog.hardware_fit_ctx.backend, "cuda");
+    assert!(
+      !dialog.recs.is_empty(),
+      "a 4 GiB CUDA card still gets recommendations"
+    );
+    assert!(dialog.shows_recommendations());
+  }
+
+  #[test]
+  fn the_fit_context_sizes_against_the_smallest_card_of_the_ranked_backend() {
+    use crate::daemon::host_metrics::DeviceRow;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let row = |name: &str, backend: &str, bytes: u64| DeviceRow {
+      selector: name.into(),
+      backend: backend.into(),
+      name: name.into(),
+      total_memory_bytes: bytes,
+      used_memory_bytes: None,
+      utilization_pct: None,
+      temperature_c: None,
+    };
+    let snapshot = crate::init::benchmark::load_bundled();
+    let mut app = App::new(AppOptions::default());
+    // Two identical cards: a launch gets one of them, so the ranking sizes for
+    // one, not for the pair the daemon sums up.
+    app.host_metrics = HostMetricsSnapshot {
+      gpu_backend: HostMetricsSnapshot::BACKEND_NVIDIA.into(),
+      gpu_mem_total_bytes: Some(48 * GIB),
+      ram_total_bytes: 64 * GIB,
+      gpu_devices: Some(vec![
+        row("RTX 4090 #0", "nvidia", 24 * GIB),
+        row("RTX 4090 #1", "nvidia", 24 * GIB),
+      ]),
+      ..Default::default()
+    };
+    assert_eq!(
+      app.hf_hardware_fit_ctx(&snapshot).vram_bytes,
+      Some(24 * GIB),
+      "two cards rank as one",
+    );
+
+    // Hybrid laptop: the iGPU's UMA marker makes the host verdict `unified`,
+    // and the daemon sums the iGPU's memory into the RTX's.
+    app.host_metrics = HostMetricsSnapshot {
+      gpu_backend: HostMetricsSnapshot::BACKEND_MULTI.into(),
+      gpu_mem_total_bytes: Some(10 * GIB),
+      ram_total_bytes: 32 * GIB,
+      unified: true,
+      uma_shared_total_bytes: Some(16 * GIB),
+      gpu_devices: Some(vec![
+        row("Iris Xe", "unknown", 2 * GIB),
+        row("RTX 4060 Laptop", "nvidia", 8 * GIB),
+      ]),
+      gpu_device_count: 2,
+      ..Default::default()
+    };
+    let ctx = app.hf_hardware_fit_ctx(&snapshot);
+    assert_eq!(
+      ctx.backend, "cuda",
+      "the discrete card is the one to rank for"
+    );
+    assert_eq!(
+      ctx.vram_bytes,
+      Some(8 * GIB),
+      "the iGPU's memory is not the RTX's"
+    );
+    assert!(
+      !ctx.unified && ctx.uma_shared_total_bytes.is_none(),
+      "a ranked discrete card is not a unified pool",
+    );
+  }
+
+  /// The repos the dialog's recommendation list shows, in rank order.
+  fn recommendation_repos(state: &crate::tui::hf_dialog::HfDialogState) -> Vec<String> {
+    use crate::init::recommender::RecommendationKind;
+    state
+      .recs
+      .iter()
+      .map(|r| match &r.kind {
+        RecommendationKind::Curated { entry } => entry.repo.clone(),
+        _ => String::new(),
+      })
+      .collect()
+  }
+
+  #[test]
+  fn a_fresher_snapshot_replaces_the_ranking_and_survives_the_next_open() {
+    let mut app = App::new(AppOptions::default());
+    app.host_metrics = HostMetricsSnapshot {
+      gpu_backend: HostMetricsSnapshot::BACKEND_NVIDIA.into(),
+      gpu_mem_total_bytes: Some(4 * 1024 * 1024 * 1024),
+      ram_total_bytes: 32 * 1024 * 1024 * 1024,
+      ..Default::default()
+    };
+    app.open_hf_dialog();
+    let before = recommendation_repos(app.hf_dialog.as_ref().unwrap());
+
+    // The remote tier answering with a catalog that kept one model's rows.
+    let mut fresh = crate::init::benchmark::load_bundled();
+    fresh.bundle_date = "2999-01-01".into();
+    fresh.models.retain(|e| e.repo == "Qwen/Qwen3-4B");
+    let evt = crate::tui::hf_dialog::HfDialogEvent::Snapshot(Box::new(fresh));
+    crate::tui::hf_pull::apply_hf_dialog_event(&mut app, evt);
+
+    let after = recommendation_repos(app.hf_dialog.as_ref().unwrap());
+    assert!(!after.is_empty(), "the fresh catalog still ranks a pick");
+    assert!(
+      after.iter().all(|repo| repo == "Qwen/Qwen3-4B"),
+      "the dialog ranks from the snapshot that arrived: {after:?}"
+    );
+    assert_ne!(before, after, "the bundled ranking was replaced");
+
+    // Cached, so a later open ranks from it without a second fetch.
+    app.close_hf_dialog();
+    app.open_hf_dialog();
+    assert_eq!(recommendation_repos(app.hf_dialog.as_ref().unwrap()), after);
   }
 
   #[test]

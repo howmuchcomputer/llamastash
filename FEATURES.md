@@ -124,6 +124,8 @@ Tab-driven Logs / Chat / Embed / Rerank that hits the same OpenAI-compatible end
 
 `d` opens a three-stage modal — **Search → File picker → Confirm** — over the live HuggingFace `/api/models` endpoint. Sort by Downloads / Likes / Recently Updated / Trending; page-by-page pagination; paste an `owner/repo[:filename]` slug + Enter to bypass search.
 
+An empty search field lists the models the recommender ranks for your hardware — the same ranking `init` and `llamastash recommend` use, in the search table's columns with the recommended quant and a fit verdict — so the dialog opens on something to pick, and Enter on a row opens its GGUF repo with the recommended quant selected. The list starts from the snapshot built into the binary and refreshes from the same daily snapshot `init` fetches.
+
 The file picker collapses shard sets and marks per-file hardware fit (`✓` / `⚠` / `✗`). A pinned download strip surfaces progress and throughput. `Ctrl+X` cancels mid-chunk; `Ctrl+D` deletes a cached repo from disk. Full keybindings in [`docs/usage.md` § HuggingFace pull dialog](docs/usage.md#huggingface-pull-dialog-focushfdialog-d-from-the-models-list).
 
 ### Theming and rebinding

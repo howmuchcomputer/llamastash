@@ -495,6 +495,29 @@ fn spawn_hf_list_repo_files(
   });
 }
 
+/// Spawn the benchmark-snapshot refresh one TUI session does. The dialog ranks
+/// from the snapshot compiled into the binary, while `init` and
+/// `llamastash recommend` rank from the tier the release pipeline publishes
+/// daily, so the two lists disagree whenever the bundle lags behind.
+/// `load_remote` takes a candidate only if it is newer and built for this
+/// binary, so the bundled ranking survives any failure — silent, as in `init`.
+pub fn spawn_hf_snapshot_refresh(
+  offline: bool,
+  events_tx: Option<mpsc::Sender<crate::tui::events::Event>>,
+) {
+  let Some(tx) = events_tx else {
+    return;
+  };
+  tokio::spawn(async move {
+    let fetch_client = build_tui_fetch_client(offline);
+    let bundled = crate::init::benchmark::load_bundled();
+    if let Ok(Some(fresh)) = crate::init::benchmark::load_remote(&fetch_client, &bundled).await {
+      let evt = crate::tui::hf_dialog::HfDialogEvent::Snapshot(Box::new(fresh));
+      let _ = tx.send(crate::tui::events::Event::HfDialog(evt)).await;
+    }
+  });
+}
+
 /// Build the dialog's FetchClient. Mirrors the wizard's resolution:
 /// honour `LLAMASTASH_OFFLINE`, fall back to a fresh client with the
 /// default config (host allowlist + redirect cap + body cap). The
@@ -615,6 +638,17 @@ pub fn apply_download_event_to(
 /// one event in at a time.
 pub fn apply_hf_dialog_event(app: &mut App, evt: crate::tui::hf_dialog::HfDialogEvent) {
   use crate::tui::hf_dialog::HfDialogEvent;
+  if let HfDialogEvent::Snapshot(snapshot) = evt {
+    let snapshot = *snapshot;
+    let ctx = app.hf_hardware_fit_ctx(&snapshot);
+    if let Some(state) = app.hf_dialog.as_mut() {
+      state.apply_snapshot(ctx, &snapshot);
+    }
+    // Cached even if the dialog closed, so the next open ranks from it without
+    // another fetch.
+    app.hf_snapshot = Some(snapshot);
+    return;
+  }
   let Some(state) = app.hf_dialog.as_mut() else {
     return;
   };
@@ -625,6 +659,8 @@ pub fn apply_hf_dialog_event(app: &mut App, evt: crate::tui::hf_dialog::HfDialog
     HfDialogEvent::RepoFilesFailed { repo_id, error } => {
       state.apply_repo_files_failed(&repo_id, &error)
     }
+    // Handled above, before the dialog's own state is borrowed.
+    HfDialogEvent::Snapshot(_) => {}
   }
 }
 

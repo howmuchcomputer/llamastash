@@ -1108,10 +1108,7 @@ fn install_choice_matches_default(candidate: &InstallChoice, default: &InstallCh
 
 fn render_recommendation(r: &Recommendation) -> (String, String) {
   match &r.kind {
-    RecommendationKind::Curated { entry } => (
-      format!("{} ({})", entry.id, entry.quant),
-      r.justification.clone(),
-    ),
+    RecommendationKind::Curated { entry } => (format!("{} ({})", entry.id, entry.quant), r.prose()),
     RecommendationKind::OnDisk {
       path, architecture, ..
     } => (

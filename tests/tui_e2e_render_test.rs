@@ -248,6 +248,15 @@ fn hf_search_golden_render_matches_fixture() {
 
 #[cfg_attr(target_os = "macos", ignore = "fixture uses Linux key glyphs")]
 #[test]
+fn hf_search_empty_golden_render_matches_fixture() {
+  assert_golden(
+    &mut seeded_hf_empty_search_app(),
+    "tests/golden/hf-search-empty.txt",
+  );
+}
+
+#[cfg_attr(target_os = "macos", ignore = "fixture uses Linux key glyphs")]
+#[test]
 fn hf_files_golden_render_matches_fixture() {
   assert_golden(&mut seeded_hf_files_app(), "tests/golden/hf-files.txt");
 }
@@ -387,6 +396,75 @@ fn seeded_hf_search_app() -> App {
       4_000_000_000,
     ),
   ];
+  app.hf_dialog = Some(state);
+  app
+}
+
+/// A three-row catalog written into the test, so the fixture pins the row
+/// rendering rather than the shipped catalog's contents: a snapshot regen must
+/// not fail this golden. The rows cover the shapes a recommendation row takes —
+/// one that fits the GPU, one that runs tight, and a mixture-of-experts pick
+/// whose experts sit in system RAM.
+fn recommendation_fixture_snapshot() -> llamastash::init::benchmark::BenchmarkSnapshot {
+  let catalog = r#"{
+    "schema_version": 1,
+    "bundle_date": "2026-01-01",
+    "min_version": "0.0.1",
+    "recommender_weights": {
+      "benchmark": 0.6,
+      "tok_per_second": 0.15,
+      "param_quality": 0.15,
+      "recency": 0.1,
+      "overhead_band_bytes": { "cuda": 1073741824 }
+    },
+    "models": [
+      { "id": "fixture-small-q4-k-m", "repo": "fixture/Tiny-Instruct-GGUF",
+        "file": "tiny-q4.gguf", "architecture": "llama", "quant": "Q4_K_M",
+        "params": 7000000000, "weights_bytes": 4294967296,
+        "task_hints": ["general"],
+        "benchmark_score": { "value": 61.5, "source": "fixturebench" },
+        "tok_s_factor": 2.4, "recency": 0.9, "source_hf_id": "fixture/Tiny-Instruct",
+        "gguf_publisher": "fixture" },
+      { "id": "fixture-roomy-q6-k", "repo": "fixture/Mid-Instruct-GGUF",
+        "file": "mid-q6.gguf", "architecture": "llama", "quant": "Q6_K",
+        "params": 27000000000, "weights_bytes": 17179869184,
+        "task_hints": ["general"],
+        "benchmark_score": { "value": 72.25, "source": "fixturebench" },
+        "tok_s_factor": 1.1, "recency": 1.0, "source_hf_id": "fixture/Mid-Instruct",
+        "gguf_publisher": "fixture" },
+      { "id": "fixture-sparse-q3-k-m", "repo": "fixture/Vast-Sparse-Instruct-GGUF",
+        "file": "vast-q3.gguf", "architecture": "qwen3next", "quant": "Q3_K_M",
+        "params": 80000000000, "weights_bytes": 36507222016,
+        "task_hints": ["general"],
+        "benchmark_score": { "value": 68.0, "source": "fixturebench" },
+        "tok_s_factor": 1.8, "recency": 1.0, "source_hf_id": "fixture/Vast-Sparse",
+        "params_active": 3000000000, "is_moe": true, "gguf_publisher": "fixture" }
+    ]
+  }"#;
+  serde_json::from_str(catalog).expect("the golden fixture's catalog parses")
+}
+
+/// Dashboard + HF dialog parked on the Search stage with an empty query: the
+/// recommender's ranked picks for a fixed 24 GiB CUDA host out of the catalog
+/// above, so the fixture pins the list and the note over it without depending
+/// on the host it runs on or on the shipped catalog.
+fn seeded_hf_empty_search_app() -> App {
+  let mut app = seeded_dashboard_app();
+  let ctx = HardwareFitContext {
+    backend: "cuda".into(),
+    vram_bytes: Some(24 * 1024 * 1024 * 1024),
+    ram_total_bytes: 32 * 1024 * 1024 * 1024,
+    ctx_tokens: llamastash::init::recommender::DEFAULT_CTX,
+    ..Default::default()
+  };
+  let snapshot = recommendation_fixture_snapshot();
+  let mut state = HfDialogState::open(false, ctx.clone());
+  state.recs = state.hardware_fit_ctx.recommendations(&snapshot);
+  assert_eq!(
+    state.recs.len(),
+    3,
+    "the fixture catalog must rank all three rows, or the golden pins nothing",
+  );
   app.hf_dialog = Some(state);
   app
 }

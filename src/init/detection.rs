@@ -258,6 +258,79 @@ pub fn detect_hardware() -> HardwareSnapshot {
   }
 }
 
+/// Inputs to [`hardware_for_recommender`] for a caller that cannot probe
+/// the GPU itself.
+#[derive(Debug, Clone, Default)]
+pub struct HostHardwareInputs {
+  /// The recommender's backend key: `cuda` / `hip` / `metal` / `cpu` /
+  /// `unknown`. Anything else lands on `CpuOnly`.
+  pub backend: String,
+  pub vram_bytes: Option<u64>,
+  pub ram_total_bytes: u64,
+  /// `true` when `vram_bytes` is the system RAM pool (Apple Silicon, UMA
+  /// APUs like Strix Halo) rather than a discrete framebuffer.
+  pub unified: bool,
+  /// Size of that shared pool, when the host reports one.
+  pub uma_shared_total_bytes: Option<u64>,
+}
+
+/// Assemble the [`HardwareSnapshot`] the recommender reads from numbers
+/// that did not come from a local probe. The TUI takes them from the
+/// daemon's `host_metrics` block, so the pull dialog can rank models
+/// without spawning the vendor GPU tools on its UI thread and ranks for
+/// the machine that stores the models. Only the recommender's inputs are
+/// filled; the wizard's banner fields (CPU brand, cores, free disk) stay
+/// empty, and nothing outside the recommender should read this snapshot.
+pub fn hardware_for_recommender(inputs: &HostHardwareInputs) -> HardwareSnapshot {
+  let gpu = match inputs.backend.as_str() {
+    "metal" => GpuInfo::AppleMetal {
+      total_memory_bytes: inputs.vram_bytes.unwrap_or(0),
+    },
+    "unknown" => GpuInfo::Unknown {
+      devices: Vec::new(),
+    },
+    "cpu" => GpuInfo::CpuOnly,
+    backend => {
+      // `is_unified` reads the UMA marker and `placement` is the only
+      // recommender path that looks at `gpu`, so the marker is what has
+      // to be right here — the rest of the device row stays unknown. With
+      // no pool size reported the value is a flag only: `is_unified`
+      // checks that it is `Some`, never what it holds.
+      let device = GpuDevice {
+        backend: backend.to_string(),
+        total_memory_bytes: inputs.vram_bytes.unwrap_or(0),
+        uma_shared_total_bytes: inputs
+          .unified
+          .then(|| inputs.uma_shared_total_bytes.unwrap_or(1)),
+        ..Default::default()
+      };
+      match backend {
+        "cuda" => GpuInfo::Nvidia {
+          devices: vec![device],
+        },
+        "hip" => GpuInfo::Amd {
+          devices: vec![device],
+        },
+        _ => GpuInfo::Unknown {
+          devices: vec![device],
+        },
+      }
+    }
+  };
+  HardwareSnapshot {
+    vram_bytes: inputs.vram_bytes,
+    gpu_device_count: if gpu.is_gpu() { 1 } else { 0 },
+    ram_total_bytes: inputs.ram_total_bytes,
+    disk_free_bytes: 0,
+    cpu_brand: String::new(),
+    cpu_cores: 0,
+    cpu_features: Vec::new(),
+    os: OsFamily::detect(),
+    cpu_arch: CpuArch::detect(),
+    gpu,
+  }
+}
+
 /// Runtime SIMD detection. We only surface features that meaningfully
 /// affect LLM inference (AVX2 / AVX-512 / FMA on x86_64; NEON / SVE on
 /// arm64). Anything not listed here is omitted to keep the banner from
@@ -474,6 +547,43 @@ pub fn detect_binary(inputs: DetectBinaryInputs) -> BinaryPresence {
 mod tests {
   use super::*;
   use crate::gpu::GpuDevice;
+
+  #[test]
+  fn hardware_for_recommender_carries_the_unified_marker_through_gpu() {
+    let gib = 1024 * 1024 * 1024;
+    let discrete = hardware_for_recommender(&HostHardwareInputs {
+      backend: "cuda".into(),
+      vram_bytes: Some(24 * gib),
+      ram_total_bytes: 64 * gib,
+      ..Default::default()
+    });
+    assert_eq!(discrete.vram_bytes, Some(24 * gib));
+    assert_eq!(discrete.ram_total_bytes, 64 * gib);
+    assert_eq!(discrete.gpu.label(), "nvidia");
+    assert_eq!(discrete.gpu_device_count, 1);
+    assert!(!discrete.gpu.is_unified());
+
+    // The UMA marker is all `placement` reads from `gpu`, so it has to
+    // survive the round trip for an APU.
+    let apu = hardware_for_recommender(&HostHardwareInputs {
+      backend: "hip".into(),
+      vram_bytes: Some(111 * gib),
+      ram_total_bytes: 128 * gib,
+      unified: true,
+      uma_shared_total_bytes: Some(111 * gib),
+    });
+    assert_eq!(apu.gpu.label(), "amd");
+    assert!(apu.gpu.is_unified());
+
+    let cpu = hardware_for_recommender(&HostHardwareInputs {
+      backend: "cpu".into(),
+      ram_total_bytes: 32 * gib,
+      ..Default::default()
+    });
+    assert_eq!(cpu.gpu.label(), "cpu_only");
+    assert_eq!(cpu.gpu_device_count, 0);
+    assert!(!cpu.gpu.is_gpu());
+  }
 
   #[test]
   fn common_locations_probe_every_server_binary_name_per_directory() {

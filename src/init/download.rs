@@ -992,7 +992,7 @@ async fn probe_repo(
 /// stem — bartowski-style repos often ship variants like
 /// `Model-Q4_K_M.gguf` and `Model-Q4_K_M-imatrix.gguf`; the plain form
 /// is the one we want.
-fn pick_quant_match(candidates: &[String], quant: &str) -> Option<String> {
+pub(crate) fn pick_quant_match(candidates: &[String], quant: &str) -> Option<String> {
   let q_lower = quant.to_lowercase();
   let mut matches: Vec<&String> = candidates
     .iter()
