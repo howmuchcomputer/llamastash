@@ -472,6 +472,39 @@ pub struct StartArgs {
   /// last-used params), the clean way to ignore prior launch state.
   #[arg(long, value_name = "NAME")]
   pub preset: Option<String>,
+  /// Every per-launch override, shared with `bench` so the two commands
+  /// layer a preset the same way.
+  #[command(flatten)]
+  pub overrides: LaunchOverrides,
+
+  /// Emit JSON instead of human-readable success prose. Stable
+  /// shape: `{ "name", "launch_id", "port", "pid", "preset",
+  /// "path" }`. Also carries `layer_sources` (the layer each resolved knob
+  /// came from) when any knob resolved from a real layer. With `--wait`,
+  /// also carries `state` and `resolved_ctx`.
+  #[arg(long)]
+  pub json: bool,
+  /// Block until the model finishes loading (reaches Ready or Error),
+  /// then report the resolved context window `--fit` chose. Default is
+  /// fire-and-forget: `start` returns as soon as the daemon accepts the
+  /// launch, while the model is still loading. Useful for big models
+  /// where you want the resolved ctx without a follow-up `status`.
+  #[arg(long)]
+  pub wait: bool,
+  /// Launch even when the memory admission gate says the model will not
+  /// fit. The gate's projection is printed as a warning instead of
+  /// refusing, and the launch proceeds. Use it when you know the
+  /// projection is wrong for your setup; if it was right, the host runs
+  /// out of memory and the OOM killer picks the victim, which may not be
+  /// this model.
+  #[arg(long)]
+  pub force: bool,
+}
+
+/// The per-launch flags that layer over a preset baseline: the same set `start`
+/// takes and `bench` must take, held once so the two cannot drift.
+#[derive(Args, Debug, Clone, Default)]
+pub struct LaunchOverrides {
   /// Context length override. A token count pins `-c`; the literal
   /// `auto` delegates the window to llama-server's `--fit` (the knob's
   /// Auto state).
@@ -524,29 +557,6 @@ pub struct StartArgs {
   /// resolves on; unset leaves the serving backend on its own default.
   #[arg(long, value_name = "N")]
   pub mtp_draft_n: Option<u32>,
-
-  /// Emit JSON instead of human-readable success prose. Stable
-  /// shape: `{ "name", "launch_id", "port", "pid", "preset",
-  /// "path" }`. Also carries `layer_sources` (the layer each resolved knob
-  /// came from) when any knob resolved from a real layer. With `--wait`,
-  /// also carries `state` and `resolved_ctx`.
-  #[arg(long)]
-  pub json: bool,
-  /// Block until the model finishes loading (reaches Ready or Error),
-  /// then report the resolved context window `--fit` chose. Default is
-  /// fire-and-forget: `start` returns as soon as the daemon accepts the
-  /// launch, while the model is still loading. Useful for big models
-  /// where you want the resolved ctx without a follow-up `status`.
-  #[arg(long)]
-  pub wait: bool,
-  /// Launch even when the memory admission gate says the model will not
-  /// fit. The gate's projection is printed as a warning instead of
-  /// refusing, and the launch proceeds. Use it when you know the
-  /// projection is wrong for your setup; if it was right, the host runs
-  /// out of memory and the OOM killer picks the victim, which may not be
-  /// this model.
-  #[arg(long)]
-  pub force: bool,
 }
 
 /// Validate a `--backend <id>` value against the live registry (plus `auto`),
@@ -2297,12 +2307,12 @@ mod tests {
       Some(Command::Start(args)) => {
         assert_eq!(args.model.as_deref(), Some("qwen-coder"));
         assert_eq!(args.preset.as_deref(), Some("coding"));
-        assert_eq!(args.ctx, Some(CtxArg::Value(32768)));
-        assert_eq!(args.port, Some(41150));
-        assert_eq!(args.reasoning, Some(ReasoningFlag::On));
-        assert_eq!(args.mode, Some(LaunchMode::Chat));
+        assert_eq!(args.overrides.ctx, Some(CtxArg::Value(32768)));
+        assert_eq!(args.overrides.port, Some(41150));
+        assert_eq!(args.overrides.reasoning, Some(ReasoningFlag::On));
+        assert_eq!(args.overrides.mode, Some(LaunchMode::Chat));
         assert_eq!(
-          args.extra,
+          args.overrides.extra,
           vec![OsString::from("--threads"), OsString::from("8")]
         );
       }
