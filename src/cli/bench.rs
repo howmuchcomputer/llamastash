@@ -281,6 +281,7 @@ impl Runner {
       Ok(p) => p,
       Err(e) => return failed(e.to_string()),
     };
+    let started = Instant::now();
     let resp = match client
       .call("start_model", Some(payload))
       .await
@@ -295,7 +296,6 @@ impl Runner {
     let launch_id = launch_id.to_string();
 
     self.progress(&format!("waiting for {label} to load…"));
-    let started = Instant::now();
     let ready = match wait_until_ready(client, &launch_id).await {
       Ok(row) => row,
       Err(e) => {
@@ -427,6 +427,16 @@ async fn tail(
     .map_err(|e| format!("requests_tail: unreadable response: {e}"))
 }
 
+/// The oldest row after `after` is this run's: a later one from another client on
+/// the same launch must not stand in for it, so it is `None` while ours is in flight.
+fn finished_run_row(rows: Vec<RequestRow>, after: u64) -> Option<RequestRow> {
+  rows
+    .into_iter()
+    .filter(|r| r.seq > after)
+    .min_by_key(|r| r.seq)
+    .filter(|r| r.state != RequestState::InFlight)
+}
+
 /// The row this run produced, once the proxy has finished it. A row scoped to the
 /// model that belongs to another launch means the request was served elsewhere,
 /// including by a launch the proxy auto-started after this one died — which bench
@@ -439,11 +449,7 @@ async fn served_row(
 ) -> Result<RequestRow, String> {
   let deadline = Instant::now() + ROW_READBACK;
   let row = loop {
-    let rows = tail(client, model_path, 20).await?;
-    if let Some(row) = rows
-      .into_iter()
-      .find(|r| r.seq > after && r.state != RequestState::InFlight)
-    {
+    if let Some(row) = finished_run_row(tail(client, model_path, 20).await?, after) {
       break row;
     }
     if Instant::now() >= deadline {
@@ -508,11 +514,18 @@ async fn is_ready(client: &mut Client, launch_id: &str) -> bool {
 /// Stop one launch this command started. A failure is that preset's note, not an
 /// abort: the remaining presets still get measured.
 async fn stop(client: &mut Client, launch_id: &str) -> Result<(), String> {
+  // The daemon can wait the launch's full stop grace before SIGKILL; a client
+  // timeout inside it cancels the stop half-done. Same budget `stop` uses.
+  let grace = fetch_status(client)
+    .await
+    .ok()
+    .and_then(|s| s.models.into_iter().find(|m| m.launch_id == launch_id))
+    .map_or(0, |m| m.stop_grace_secs);
   client
     .call_with_timeout(
       "stop_model",
       Some(json!({ "launch_id": launch_id })),
-      Duration::from_secs(30),
+      Duration::from_secs(grace.max(5).saturating_add(5)),
     )
     .await
     .map(|_| ())
@@ -704,6 +717,25 @@ mod tests {
       Some(Command::Bench(args)) => args,
       other => panic!("expected bench, got {other:?}"),
     }
+  }
+
+  #[test]
+  fn the_run_row_is_the_oldest_after_the_mark_and_only_once_finished() {
+    let row = |seq, state| RequestRow {
+      seq,
+      state,
+      ..RequestRow::default()
+    };
+    // Newest first, as `requests_tail` returns them.
+    let ours_in_flight = vec![
+      row(7, RequestState::Done),
+      row(6, RequestState::InFlight),
+      row(5, RequestState::Done),
+    ];
+    assert_eq!(finished_run_row(ours_in_flight, 5), None);
+    let ours_done = vec![row(7, RequestState::Done), row(6, RequestState::Done)];
+    assert_eq!(finished_run_row(ours_done, 5).map(|r| r.seq), Some(6));
+    assert_eq!(finished_run_row(vec![row(5, RequestState::Done)], 5), None);
   }
 
   #[test]
