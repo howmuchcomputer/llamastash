@@ -539,7 +539,7 @@ _Shared context: Alias resolution in the proxy, the `/v1/models` and `/api/tags`
 
 ## R18 (v0.11.0 checklist)
 
-Minor release. Batch 1 is the only one that can delete the wrong file. Batch 2 is the discovery scan duplicating or resurrecting rows. Batch 3 is what a media launch reports and when the catalog is ready. Batch 4 is three small fixes where the user is shown a number or a flag that is not the one they got.
+Minor release. Batches 5 and 6 are the new surfaces: `llamastash bench` for per-preset speed numbers, and `llamastash delete` so an agent can remove a model it pulled. Batch 1 is the only one that can delete the wrong file. Batch 2 is the discovery scan duplicating or resurrecting rows. Batch 3 is what a media launch reports and when the catalog is ready. Batch 4 is three small fixes where the user is shown a number or a flag that is not the one they got.
 
 ### Batch 1: delete safety
 
@@ -575,6 +575,20 @@ _Shared context: the launch table in `src/cli/status.rs` and the TUI, the `mode_
 
 - [ ] **The request log's aggregate windows read a stepped clock as idle time.** `Throughput::add` and `add_prefill` ([`src/proxy/request_log.rs`](src/proxy/request_log.rs)) take `started_at_ms` from the wall clock and `duration_ms` from a monotonic timer. A clock step or a suspend while rows sit in the 1000-row ring moves their windows apart, so `busy_ms` and `prefill_busy_ms` read high and `Agg tok/s` / `Agg PP tok/s` low until those rows roll out. Carry a monotonic start on the row (`#[serde(skip)]`) and build the windows from it.
 
+### Batch 5: `llamastash bench` — per-preset speed numbers
+
+_Shared context: a new verb in `src/cli/` over `src/ipc/methods.rs`, the `--json` wrapper, the preset resolution in `src/daemon/launch_service.rs`, the speed-field lookup behind the live stats and `llamastash requests`, `docs/usage.m- [ ] **`llamastash bench <model> [--preset a,b]`.** A quick speed number per preset, so a user can compare knob changes without the maintainer scripts in `scripts/bench/`. Per preset: start, wait for ready, send a fixed prompt N times, read the server-reported prompt and generation tok/s (same field lookup as live speed stats) plus a wall-clock first token, then stop what it started. Table on a TTY and `--json`. Open: cycling presets goes through admission and make-room, and a server that reports no speed fields gets clock-only numbers. The two open points get settled as part of building it: what a preset cycle costs through admission and make-room, and what a server that reports no speed fields gets besides clock-only numbers.
+
+- [ ] **`llamastash bench <model> [--preset a,b]`.** A quick speed number per preset, so a user can compare knob changes without the maintainer scripts in `scripts/bench/`. Per preset: start, wait for ready, send a fixed prompt N times, read the server-reported prompt and generation tok/s (same field lookup as live speed stats) plus a wall-clock first token, then stop what it started. Table on a TTY and `--json`. Open: cycling presets goes through admission and make-room, and a server that reports no speed fields gets clock-only numbers. The two open points get settled as part of building it: what a preset cycle costs through admission and make-room, and what a server that reports no speed fields gets besides clock-only numbers.
+
+### Batch 6: `llamastash delete` — the CRUD verb missing from the agent contract
+
+_Shared context: `DeletePlan`, `plan_for_path` and `execute` in [`src/tui/delete.rs`](src/tui/delete.rs), a new method in `src/ipc/methods.rs`, the `--yes` non-TTY rule `stop --all` already follows, `docs/usage.md`. Moves with Batch 1, which is in the same code._
+
+- [ ] **Deleting a model is TUI-only**, so an agent can pull a model but never remove one. `delete::plan_for_path` / `execute` have exactly two callers, both in `src/tui/events.rs`; there is no `delete` subcommand (the CLI's `Delete` is `presets delete`) and no `delete_model` IPC method. It is the one CRUD verb off the agent contract, and it is not a scope boundary.
+  - `DeletePlan` encodes six things `rm -rf` gets wrong: split-set shards, an mmproj projector another model still pairs with, a separate MTP draft head, a cache repo that still holds a second quant, HF blob symlinks shared between snapshots, and whether there are blobs to promise back at all. vLLM widened this with directory-shaped rows and the nested-GGUF case, so the newest model type is also the one only a human can delete.
+  - Open decision before implementing: whether the plan/execute half moves out of `src/tui/` (it does no rendering) so a CLI path reuses it instead of reimplementing it, and whether `delete` refuses without `--yes` in a non-TTY the way `stop --all` does.
+
 ## Next
 
 _Empty as of 2026-10-31: what was here went into the R18 checklist or into a High / Low roadmap batch. New loose items land here until the next release is planned._
@@ -589,15 +603,9 @@ Items are grouped into batches by what a work session loads to do them - the sam
 
 _Shared context: `src/cli/`, `src/ipc/methods.rs`, the `--json` wrapper, `docs/usage.md`._
 
-- [ ] **`llamastash bench <model> [--preset a,b]`.** A quick speed number per preset, so a user can compare knob changes without the maintainer scripts in `scripts/bench/`. Per preset: start, wait for ready, send a fixed prompt N times, read the server-reported prompt and generation tok/s (same field lookup as live speed stats) plus a wall-clock first token, then stop what it started. Table on a TTY and `--json`. Open: cycling presets goes through admission and make-room, and a server that reports no speed fields gets clock-only numbers.
-
 - [ ] **`llamastash ask <model> [-p "prompt"]` — one-shot prompt from the shell.** Start the model if it is dormant, stream the answer to stdout, then either leave it to the idle sweep or stop it with the launch. Accept stdin and `--file`, take `--system`, emit `--json` with the timings and token counts. Today a scripted prompt has to get the key (via `llamastash api-key` or `runtime.json`) and build its own OpenAI request: chat lives only in the TUI (`src/tui/tabs`, `src/tui/oai_client.rs`) and `start` has no prompt flag, so there is no `ollama run <model> "prompt"` equivalent. Open: go through the proxy (`/v1/chat/completions`, which gets routing, auto-start, fallback and residency for free) or straight to the launch port and re-implement the wait-for-ready.
 
 - [ ] **`llamastash storage` — disk accounting and reclaim over every cache root.** `show` gives one model's size (shards summed); nothing answers "what is using my disk and what can I delete". Report per-root and per-model bytes across the roots `util::model_caches` already resolves (HF hub, Ollama, LM Studio) plus the llamastash cache dir (`logs`) and state dir (llama.cpp installs under `llama-cpp/bNNNN/`, `state.json`), split into catalog rows versus files nothing references, with `--dry-run` and `--free <SIZE>` that keeps favorites and stops at the target. Reuse `delete::plan_for_path` / `execute` for removal, which is TUI-only today (see the delete entry below). Open: each HF repo keeps its own `models--<owner>--<repo>/blobs/<etag>` with snapshot symlinks over it (`src/util/model_caches.rs`, `src/init/download.rs:20`), so the same weights pulled into two repos are two separate files; confirm with inode link counts before writing any reclaim logic, since the number a delete actually frees depends on that.
-
-- [ ] **Deleting a model is TUI-only**, so an agent can pull a model but never remove one. `delete::plan_for_path` / `execute` have exactly two callers, both in `src/tui/events.rs`; there is no `delete` subcommand (the CLI's `Delete` is `presets delete`) and no `delete_model` IPC method. It is the one CRUD verb off the agent contract, and it is not a scope boundary.
-  - `DeletePlan` encodes six things `rm -rf` gets wrong: split-set shards, an mmproj projector another model still pairs with, a separate MTP draft head, a cache repo that still holds a second quant, HF blob symlinks shared between snapshots, and whether there are blobs to promise back at all. vLLM widened this with directory-shaped rows and the nested-GGUF case, so the newest model type is also the one only a human can delete.
-  - Open decision before implementing: whether the plan/execute half moves out of `src/tui/` (it does no rendering) so a CLI path reuses it instead of reimplementing it, and whether `delete` refuses without `--yes` in a non-TTY the way `stop --all` does.
 
 #### Batch H2 - Install and update channels
 
