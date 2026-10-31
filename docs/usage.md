@@ -637,49 +637,65 @@ llamastash bench <model-ref> [--preset a,b] [--runs N] [--max-tokens N] [--promp
 Per preset it starts the model, waits for Ready, sends one fixed prompt `--runs` times through the proxy, reads the speeds the request log already holds for those requests, then stops the launch it started. Nothing else is stopped and nothing is unloaded to make room: a `start` from the CLI never evicts another launch, so a preset the machine cannot fit is that row's error and the remaining presets are still measured.
 
 ```
-PRESET   LOAD   PP tok/s  TG tok/s  TTFT   RUNS  NOTE
-default  2.5s   64.0      9.9       367ms  2/2   -
-fast     1.0s   82.0      12.6      277ms  2/2   -
+PRESET  LOAD  CTX    IN   OUT  PP tok/s  TG tok/s  TTFT   RUNS  NOTE
+small   2.2s  4096   969  64   1457      35.2      681ms  2/2   -
+big     2.2s  16384  969  64   1281      27.1      836ms  2/2   -
 ```
 
 - `--preset a,b` names saved presets, comma-separated, benched in that order. Without it, one cycle on the model's `default:` preset, which is the baseline a plain `start <model-ref>` uses. `auto` benches pure fit (no preset, no last-used params) and reads as the row `auto`. A name that is not saved is a usage error raised before anything starts, so a typo costs no model load.
 - Every per-launch override `start` takes works here and is layered exactly as it is on `start`: the preset's own params, the overrides on top, for every preset in the list. With `--ctx 4096` on the command line every row measures a 4096 context, whatever context each preset sets. The one exception is `--mode`, which takes only `chat` here; a preset that pins a non-chat mode is that row's error rather than an up-front refusal, because it is only visible once the launch is up.
-- `LOAD` is the wall clock from the start call to the Ready row, so it carries the model load. `PP tok/s` and `TG tok/s` are prompt-processing and generation speed, `TTFT` the time to the first token. Each is the median over the runs that finished, read from the same fields [`llamastash requests`](#llamastash-requests-model-ref) prints, from this launch's own rows only. A leading `~` marks a figure the proxy estimated because the server reported none, exactly as in `requests`; a metric no run reported reads `-` rather than 0.
+- `LOAD` is the wall clock from the start call to the Ready row, so it carries the model load. `CTX` is the context window the launch ended up with, as `status` reports it (`resolved_ctx`), so a preset that leaves the context to the engine's fitter shows what it chose. `IN` and `OUT` are the prompt tokens and the generated tokens per request. `PP tok/s` and `TG tok/s` are prompt-processing and generation speed, `TTFT` the time to the first token. Each is the median over the runs that finished, read from the same fields [`llamastash requests`](#llamastash-requests-model-ref) prints, from this launch's own rows only. A leading `~` marks a figure the proxy estimated because the server reported none, exactly as in `requests`; a metric no run reported reads `-` rather than 0.
 - `RUNS` is runs that finished over runs asked for. `NOTE` says what went wrong when a preset produced no numbers: an admission refusal, a launch that settled in `error`, a stop that failed.
 - `--runs` (default 3, at least 1) and `--max-tokens` (default 256) size the work. The prompt is `--prompt`, or a file through `--prompt-file`, or a built-in fixed passage of about 1,000 tokens when neither is given, long enough that prompt processing is worth measuring. Every request sends a `Run <n>.` prefix, so the second run prefills the prompt again instead of answering from the KV cache the first one filled.
 - Progress (`starting fast…`, `fast: run 2/2`) goes to stderr and is silent under `--json` and `--quiet`; the table and the JSON go to stdout. Piped stdout gets the header plus one tab-separated line per preset. Ctrl-C stops whatever launches of that model are still up, then exits `71` (`UNKNOWN`) without printing results.
 - Chat models only, and the model must not already be running: `bench` refuses and names the running launch before starting anything, because a launch you started carries the params it started with, not the ones under test.
 
-`--json` emits `{ "model": ..., "runs": ..., "max_tokens": ..., "results": [...] }`, one result per preset in the order asked for. Every key is always present and a figure no run reported is `null`. `preset` is `null` for the `default:` baseline; `error` is `null` for a preset that produced numbers and the reason it did not otherwise; `launch_id` names the launch that produced them. A preset that failed still gets its result object, so stdout stays parseable when the exit code is `67`.
+`--json` emits `{ "model": ..., "model_path": ..., "runs": ..., "max_tokens": ..., "results": [...] }`, one result per preset in the order asked for. Every key is always present and a figure no run reported is `null`. `preset` is `null` for the `default:` baseline; `error` is `null` for a preset that produced numbers and the reason it did not otherwise; `launch_id` names the launch that produced them and `name` its launch name. `ctx`, `params` (the launch's resolved params and knobs) and `rss_bytes` (the engine process's resident memory after the runs, not counting GPU memory) are read from `status` before the launch is stopped. `prefill_tokens` is the part of the prompt the engine computed and `cached_tokens` the part it reused from its KV cache, which the `Run <n>.` prefix keeps near 0; `duration_ms` is the whole request. A preset that failed still gets its result object, so stdout stays parseable when the exit code is `67`.
 
 ```json
 {
   "model": "decider-4b-v3-Q4_K_M.gguf",
+  "model_path": "/mnt/work/models/decider-4b/decider-4b-v3-Q4_K_M.gguf",
   "runs": 1,
   "max_tokens": 16,
   "results": [
     {
-      "preset": "fast",
-      "launch_id": "L1",
-      "load_ms": 1018,
-      "prompt_tokens": 22,
-      "prefill_tokens_per_second": 71.6306722538591,
+      "preset": "small",
+      "launch_id": "L3",
+      "name": "small",
+      "load_ms": 2150,
+      "ctx": 4096,
+      "params": {
+        "mode": "chat",
+        "ctx": 4096,
+        "knobs": { "ctx-size": 4096, "n-gpu-layers": "auto" },
+        "...": "the rest of the launch's params, as `status` shows them"
+      },
+      "rss_bytes": 1654960128,
+      "prompt_tokens": 969,
+      "prefill_tokens": 969,
+      "cached_tokens": 0,
+      "prefill_tokens_per_second": 1393.514763490776,
       "prefill_estimated": false,
       "completion_tokens": 16,
-      "tokens_per_second": 12.612397482229133,
+      "tokens_per_second": 35.19375334340657,
       "tokens_per_second_estimated": false,
-      "ttft_ms": 309,
+      "ttft_ms": 701,
+      "duration_ms": 1128,
       "runs_done": 1,
       "error": null,
       "samples": [
         {
-          "prompt_tokens": 22,
+          "prompt_tokens": 969,
+          "prefill_tokens": 969,
+          "cached_tokens": 0,
           "completion_tokens": 16,
-          "prefill_tokens_per_second": 71.6306722538591,
+          "prefill_tokens_per_second": 1393.514763490776,
           "prefill_estimated": false,
-          "tokens_per_second": 12.612397482229133,
+          "tokens_per_second": 35.19375334340657,
           "tokens_per_second_estimated": false,
-          "ttft_ms": 309
+          "ttft_ms": 701,
+          "duration_ms": 1128
         }
       ]
     }

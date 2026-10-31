@@ -43,6 +43,9 @@ const LOAD_CEILING: Duration = Duration::from_secs(900);
 /// which would inflate the load number.
 const READY_POLL: Duration = Duration::from_millis(250);
 
+/// How long to wait after the runs for the daemon to record the launch's context.
+const CTX_GRACE: Duration = Duration::from_secs(2);
+
 /// The paragraph the built-in prompt repeats: plain prose, long enough that a
 /// handful of repeats lands near 1k tokens.
 const PROMPT_PARAGRAPH: &str = "The harbour kept its own hours. Fishing boats came back before dawn and \
@@ -85,6 +88,9 @@ fn resolve_prompt(args: &BenchArgs) -> Result<String, CliExit> {
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 struct Sample {
   prompt_tokens: Option<u64>,
+  /// Prompt tokens the engine computed, the ones reused from its KV cache left out.
+  prefill_tokens: Option<u64>,
+  cached_tokens: Option<u64>,
   completion_tokens: Option<u64>,
   prefill_tokens_per_second: Option<f64>,
   prefill_estimated: bool,
@@ -93,18 +99,23 @@ struct Sample {
   /// Time to the first generated token, i.e. the row's `prefill_end_ms`. Only a
   /// streamed response carries it.
   ttft_ms: Option<u64>,
+  /// The whole request, receipt to last byte.
+  duration_ms: Option<u64>,
 }
 
 impl Sample {
   fn from_row(row: &RequestRow) -> Self {
     Self {
       prompt_tokens: row.prompt_tokens,
+      prefill_tokens: row.prefill_tokens,
+      cached_tokens: row.cached_tokens,
       completion_tokens: row.completion_tokens,
       prefill_tokens_per_second: row.prefill_tokens_per_second,
       prefill_estimated: row.prefill_estimated,
       tokens_per_second: row.tokens_per_second,
       tokens_per_second_estimated: row.tokens_per_second_estimated,
       ttft_ms: row.prefill_end_ms,
+      duration_ms: row.duration_ms,
     }
   }
 
@@ -132,12 +143,15 @@ impl Sample {
     };
     Self {
       prompt_tokens: count(|s| s.prompt_tokens),
+      prefill_tokens: count(|s| s.prefill_tokens),
+      cached_tokens: count(|s| s.cached_tokens),
       completion_tokens: count(|s| s.completion_tokens),
       prefill_tokens_per_second: median_of(|s| s.prefill_tokens_per_second),
       prefill_estimated: samples.iter().any(|s| s.prefill_estimated),
       tokens_per_second: median_of(|s| s.tokens_per_second),
       tokens_per_second_estimated: samples.iter().any(|s| s.tokens_per_second_estimated),
       ttft_ms: count(|s| s.ttft_ms),
+      duration_ms: count(|s| s.duration_ms),
     }
   }
 }
@@ -165,6 +179,14 @@ struct PresetResult {
   preset: Option<String>,
   launch_id: Option<String>,
   load_ms: Option<u64>,
+  /// The launch's own name, which a preset launch takes from the preset.
+  name: Option<String>,
+  /// The context window the launch ended up with, as `status` reports it.
+  ctx: Option<u32>,
+  /// The params the launch resolved to, as `status` reports them.
+  params: Option<Value>,
+  /// The engine process's resident memory after the runs. GPU memory is not in it.
+  rss_bytes: Option<u64>,
   error: Option<String>,
   samples: Vec<Sample>,
 }
@@ -189,14 +211,21 @@ impl PresetResult {
     json!({
       "preset": self.preset,
       "launch_id": self.launch_id,
+      "name": self.name,
       "load_ms": self.load_ms,
+      "ctx": self.ctx,
+      "params": self.params,
+      "rss_bytes": self.rss_bytes,
       "prompt_tokens": agg.prompt_tokens,
+      "prefill_tokens": agg.prefill_tokens,
+      "cached_tokens": agg.cached_tokens,
       "prefill_tokens_per_second": agg.prefill_tokens_per_second,
       "prefill_estimated": agg.prefill_estimated,
       "completion_tokens": agg.completion_tokens,
       "tokens_per_second": agg.tokens_per_second,
       "tokens_per_second_estimated": agg.tokens_per_second_estimated,
       "ttft_ms": agg.ttft_ms,
+      "duration_ms": agg.duration_ms,
       "runs_done": self.samples.len(),
       "error": self.error,
       "samples": self.samples,
@@ -209,6 +238,12 @@ impl PresetResult {
     vec![
       self.label(),
       self.load_ms.map(fmt_ms).unwrap_or_else(|| NONE.into()),
+      self
+        .ctx
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| NONE.into()),
+      c.tokens_in,
+      c.tokens_out,
       c.prefill,
       c.speed,
       agg.ttft_ms.map(fmt_ms).unwrap_or_else(|| NONE.into()),
@@ -218,8 +253,8 @@ impl PresetResult {
   }
 }
 
-const HEADER: [&str; 7] = [
-  "PRESET", "LOAD", "PP tok/s", "TG tok/s", "TTFT", "RUNS", "NOTE",
+const HEADER: [&str; 10] = [
+  "PRESET", "LOAD", "CTX", "IN", "OUT", "PP tok/s", "TG tok/s", "TTFT", "RUNS", "NOTE",
 ];
 
 /// Everything the cycles share, fixed before the first launch so one preset's
@@ -320,9 +355,11 @@ impl Runner {
     let mut result = PresetResult {
       preset: preset.map(str::to_string),
       launch_id: Some(launch_id.clone()),
+      name: ready.name.clone(),
       load_ms: Some(load_ms),
       error: None,
       samples: Vec::new(),
+      ..PresetResult::default()
     };
     for run in 1..=self.runs {
       self.progress(&format!("{label}: run {run}/{}", self.runs));
@@ -352,6 +389,13 @@ impl Runner {
           break;
         }
       }
+    }
+    // Read now, not at Ready: the daemon stamps `resolved_ctx` a beat after it,
+    // and the memory figure is the one after the runs.
+    if let Some(row) = settled_launch_row(client, &launch_id).await {
+      result.ctx = row.resolved_ctx;
+      result.params = row.params;
+      result.rss_bytes = row.latest_rss_bytes;
     }
     if let Err(e) = stop(client, &launch_id).await {
       result.error = Some(match result.error.take() {
@@ -499,6 +543,26 @@ async fn wait_until_ready(client: &mut Client, launch_id: &str) -> Result<Runnin
     }
   }
   Err("the model never came ready in time".to_string())
+}
+
+async fn launch_row(client: &mut Client, launch_id: &str) -> Option<RunningRow> {
+  let snap = fetch_status(client).await.ok()?;
+  snap.models.into_iter().find(|m| m.launch_id == launch_id)
+}
+
+/// The launch's row once `resolved_ctx` has landed, waiting at most
+/// [`CTX_GRACE`] for it: runs against a fast engine can finish before the daemon
+/// has read the context back, and an engine that never reports one costs only
+/// that wait.
+async fn settled_launch_row(client: &mut Client, launch_id: &str) -> Option<RunningRow> {
+  let deadline = Instant::now() + CTX_GRACE;
+  loop {
+    let row = launch_row(client, launch_id).await?;
+    if row.resolved_ctx.is_some() || Instant::now() >= deadline {
+      return Some(row);
+    }
+    tokio::time::sleep(READY_POLL).await;
+  }
 }
 
 async fn is_ready(client: &mut Client, launch_id: &str) -> bool {
@@ -679,6 +743,7 @@ pub async fn handle(args: BenchArgs, cli: &Cli, config: &Config) -> CliResult {
       "{}",
       pretty_json(&json!({
         "model": row.name(),
+        "model_path": row.path,
         "runs": args.runs,
         "max_tokens": args.max_tokens,
         "results": results.iter().map(PresetResult::json).collect::<Vec<_>>(),
@@ -830,6 +895,10 @@ mod tests {
       preset: Some("coder".into()),
       launch_id: Some("L4".into()),
       load_ms: Some(8123),
+      name: Some("coder".into()),
+      ctx: Some(16384),
+      params: Some(json!({ "ctx": 16384 })),
+      rss_bytes: Some(1 << 30),
       error: None,
       samples: vec![Sample {
         prompt_tokens: Some(1012),
@@ -837,6 +906,9 @@ mod tests {
         prefill_tokens_per_second: Some(812.4),
         tokens_per_second: Some(41.2),
         ttft_ms: Some(1310),
+        prefill_tokens: Some(1000),
+        cached_tokens: Some(12),
+        duration_ms: Some(7600),
         ..Sample::default()
       }],
     };
@@ -844,6 +916,13 @@ mod tests {
     assert_eq!(v["preset"], "coder");
     assert_eq!(v["launch_id"], "L4");
     assert_eq!(v["load_ms"], 8123);
+    assert_eq!(v["ctx"], 16384);
+    assert_eq!(v["name"], "coder");
+    assert_eq!(v["params"]["ctx"], 16384);
+    assert_eq!(v["rss_bytes"], 1u64 << 30);
+    assert_eq!(v["prefill_tokens"], 1000);
+    assert_eq!(v["cached_tokens"], 12);
+    assert_eq!(v["duration_ms"], 7600);
     assert_eq!(v["prompt_tokens"], 1012);
     assert_eq!(v["prefill_tokens_per_second"], 812.4);
     assert_eq!(v["prefill_estimated"], false);
@@ -867,9 +946,9 @@ mod tests {
   fn the_table_labels_an_unnamed_preset_and_blanks_what_is_missing() {
     let cells = PresetResult::failed(None, "boom".into()).cells(3);
     assert_eq!(cells[0], "default");
-    assert_eq!(&cells[1..5], [NONE, NONE, NONE, NONE]);
-    assert_eq!(cells[5], "0/3");
-    assert_eq!(cells[6], "boom");
+    assert_eq!(&cells[1..8], [NONE; 7]);
+    assert_eq!(cells[8], "0/3");
+    assert_eq!(cells[9], "boom");
   }
 
   /// An estimated speed prints with the `~` `llamastash requests` uses, which is
@@ -887,7 +966,7 @@ mod tests {
     };
     let cells = row.cells(1);
     assert_eq!(cells[0], "auto");
-    assert!(cells[3].starts_with('~'), "{}", cells[3]);
+    assert!(cells[6].starts_with('~'), "{}", cells[6]);
   }
 
   #[test]

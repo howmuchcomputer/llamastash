@@ -532,7 +532,7 @@ pub struct BenchArgs {
   /// Read the prompt from this file instead of `--prompt` or the built-in one.
   #[arg(long, value_name = "PATH")]
   pub prompt_file: Option<PathBuf>,
-  /// Emit `{ "model", "runs", "max_tokens", "results" }` as JSON, with the
+  /// Emit `{ "model", "model_path", "runs", "max_tokens", "results" }` as JSON, with the
   /// per-run samples under each result. Progress lines go to stderr instead.
   #[arg(long)]
   pub json: bool,

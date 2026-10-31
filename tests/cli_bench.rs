@@ -259,6 +259,10 @@ fn a_bench_run_reports_the_server_reported_speeds_and_stops_what_it_started() {
     result["load_ms"].is_number(),
     "load time is measured: {result}"
   );
+  assert!(
+    result["ctx"].is_number(),
+    "the launch's resolved context is read from status: {result}"
+  );
   assert_eq!(result["samples"].as_array().unwrap().len(), 2);
   assert_eq!(result["runs_done"], 2);
   assert_eq!(daemon.running(), 0, "bench stopped the launch it started");
@@ -314,16 +318,17 @@ fn the_piped_table_prints_one_row_with_placeholders() {
   let lines: Vec<&str> = text.lines().collect();
   assert_eq!(
     lines[0],
-    "PRESET\tLOAD\tPP tok/s\tTG tok/s\tTTFT\tRUNS\tNOTE"
+    "PRESET\tLOAD\tCTX\tIN\tOUT\tPP tok/s\tTG tok/s\tTTFT\tRUNS\tNOTE"
   );
   assert_eq!(lines.len(), 2, "one row: {lines:?}");
   let cells: Vec<&str> = lines[1].split('\t').collect();
   assert_eq!(cells[0], "default");
   assert_ne!(cells[1], "-", "the load time is always measured");
-  assert_eq!(cells[2], "-");
-  assert_eq!(cells[3], "-");
-  assert_eq!(cells[5], "1/1");
+  assert_ne!(cells[2], "-", "the launch's context comes from status");
+  assert_eq!(cells[5], "-");
   assert_eq!(cells[6], "-");
+  assert_eq!(cells[8], "1/1");
+  assert_eq!(cells[9], "-");
   assert_eq!(daemon.running(), 0);
 }
 
