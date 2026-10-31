@@ -537,9 +537,9 @@ _Shared context: Alias resolution in the proxy, the `/v1/models` and `/api/tags`
 - [x] ~~A `proxy.aliases` entry is invisible to an agent until a client hits it~~ — done: `list --json` carries the whole table under a top-level `aliases` array (`{name, target, state}`, `state` one of `ok` / `shadowed` / `dead` / `ambiguous` / `chain`), from the new read-only `proxy_aliases` IPC method, and the daemon runs one audit pass over the table as soon as its catalog has a row — the same once-per-name warnings a request would spend, so nothing is said twice and nothing is missed. `status --json` and `doctor` stay as they are: `list --json` is the read-only surface.
 - [x] ~~Three claims about the alias rows in `/v1/models` and `/api/tags` have no test behind them: an alias whose target two models answer to (the `ambiguous_model` refusal that keeps it out of the listing), the `mode` field an alias row inherits from the model it names, and that a listing never spends the once-per-name alias warnings real requests need. The case-only shadow (`Qwen3` id beside a `qwen3` alias) is pinned in both listings.~~ — done: both listings pin the ambiguous-target refusal and the inherited mode (through `/api/show`'s `capabilities`, where the Ollama shape spells mode out), and the shared alias pass is pinned not to spend a warning a request still owes.
 
-## R18 (v0.10.2 checklist)
+## R18 (v0.11.0 checklist)
 
-Patch release. Batch 1 is the only one that can delete the wrong file. Batch 2 is the discovery scan duplicating or resurrecting rows. Batch 3 is what a media launch reports and when the catalog is ready. Batch 4 is three small fixes where the user is shown a number or a flag that is not the one they got.
+Minor release. Batch 1 is the only one that can delete the wrong file. Batch 2 is the discovery scan duplicating or resurrecting rows. Batch 3 is what a media launch reports and when the catalog is ready. Batch 4 is three small fixes where the user is shown a number or a flag that is not the one they got.
 
 ### Batch 1: delete safety
 
