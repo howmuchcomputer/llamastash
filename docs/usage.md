@@ -643,19 +643,20 @@ fast     1.0s   82.0      12.6      277ms  2/2   -
 ```
 
 - `--preset a,b` names saved presets, comma-separated, benched in that order. Without it, one cycle on the model's `default:` preset, which is the baseline a plain `start <model-ref>` uses. `auto` benches pure fit (no preset, no last-used params) and reads as the row `auto`. A name that is not saved is a usage error raised before anything starts, so a typo costs no model load.
-- Every per-launch override `start` takes works here and is layered exactly as it is on `start`: the preset's own params, the overrides on top, for every preset in the list. A preset that sets `ctx_size` and a `--ctx-size 4096` on the command line measures 4096 in every row.
+- Every per-launch override `start` takes works here and is layered exactly as it is on `start`: the preset's own params, the overrides on top, for every preset in the list. A preset that sets `ctx_size` and a `--ctx-size 4096` on the command line measures 4096 in every row. The one exception is `--mode`, which takes only `chat` here; a preset that pins a non-chat mode is that row's error rather than an up-front refusal, because it is only visible once the launch is up.
 - `LOAD` is the wall clock from the start call to the Ready row, so it carries the model load. `PP tok/s` and `TG tok/s` are prompt-processing and generation speed, `TTFT` the time to the first token. Each is the median over the runs that finished, read from the same fields [`llamastash requests`](#llamastash-requests-model-ref) prints, from this launch's own rows only. A leading `~` marks a figure the proxy estimated because the server reported none, exactly as in `requests`; a metric no run reported reads `-` rather than 0.
 - `RUNS` is runs that finished over runs asked for. `NOTE` says what went wrong when a preset produced no numbers: an admission refusal, a launch that settled in `error`, a stop that failed.
 - `--runs` (default 3, at least 1) and `--max-tokens` (default 256) size the work. The prompt is `--prompt`, or a file through `--prompt-file`, or a built-in fixed passage of about 1,000 tokens when neither is given, long enough that prompt processing is worth measuring. Every request sends a `Run <n>.` prefix, so the second run prefills the prompt again instead of answering from the KV cache the first one filled.
 - Progress (`starting fast…`, `fast: run 2/2`) goes to stderr and is silent under `--json` and `--quiet`; the table and the JSON go to stdout. Piped stdout gets the header plus one tab-separated line per preset. Ctrl-C stops whatever launches of that model are still up before the command returns.
 - Chat models only, and the model must not already be running: `bench` refuses and names the running launch before starting anything, because a launch you started carries the params it started with, not the ones under test.
 
-`--json` emits `{ "model": ..., "runs": ..., "results": [...] }`, one result per preset in the order asked for. Every key is always present and a figure no run reported is `null`. `preset` is `null` for the `default:` baseline; `error` is `null` for a preset that produced numbers and the reason it did not otherwise; `launch_id` names the launch that produced them. A preset that failed still gets its result object, so stdout stays parseable when the exit code is `67`.
+`--json` emits `{ "model": ..., "runs": ..., "max_tokens": ..., "results": [...] }`, one result per preset in the order asked for. Every key is always present and a figure no run reported is `null`. `preset` is `null` for the `default:` baseline; `error` is `null` for a preset that produced numbers and the reason it did not otherwise; `launch_id` names the launch that produced them. A preset that failed still gets its result object, so stdout stays parseable when the exit code is `67`.
 
 ```json
 {
   "model": "decider-4b-v3-Q4_K_M.gguf",
   "runs": 1,
+  "max_tokens": 16,
   "results": [
     {
       "preset": "fast",
