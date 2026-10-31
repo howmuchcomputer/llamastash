@@ -788,7 +788,7 @@ fn build_payload(
   Value::Object(obj)
 }
 
-fn map_start_error(e: crate::ipc::ClientError, row: &CatalogRow) -> CliExit {
+pub(crate) fn map_start_error(e: crate::ipc::ClientError, row: &CatalogRow) -> CliExit {
   use crate::backend::Backend;
   use crate::ipc::protocol::ErrorCode;
   use crate::ipc::ClientError;
