@@ -608,10 +608,6 @@ pub fn vram_fit_for_file(
 }
 
 impl FileFit {
-  /// Single-char glyph the file picker renders next to each row.
-  /// `Unknown` returns an em-dash `—` (R113 — the picker keeps the
-  /// fit column width stable across rows; a blank slot would shift
-  /// the rest of the line when the sampler is still warming up).
   /// The verdict as a word, for a column or legend that spells it out.
   pub fn word(self) -> &'static str {
     match self {
@@ -622,6 +618,10 @@ impl FileFit {
     }
   }
 
+  /// Single-char glyph the file picker renders next to each row.
+  /// `Unknown` returns an em-dash `—` (R113 — the picker keeps the
+  /// fit column width stable across rows; a blank slot would shift
+  /// the rest of the line when the sampler is still warming up).
   pub fn glyph(self) -> &'static str {
     match self {
       FileFit::Fit => "✓",

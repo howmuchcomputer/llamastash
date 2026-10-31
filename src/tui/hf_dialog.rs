@@ -1282,9 +1282,8 @@ fn render_search_row(
 }
 
 /// Column widths shared by the search and recommendation tables, so both put
-/// repo, format, params and size under the same header cells. The variable
-/// column (`TRAILING_COL`) carries the sort-dependent metric on a search row and
-/// the fit verdict on a recommendation row.
+/// repo, format, params and size under the same header cells. `TRAILING_COL`
+/// is the search row's `task` column.
 const REPO_COL: usize = 36;
 const FMT_COL: usize = 4;
 const PARAMS_COL: usize = 6;

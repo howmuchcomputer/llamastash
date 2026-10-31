@@ -47,12 +47,6 @@ pub enum ToastKind {
 /// lives inside it (see [`App::right_pane_visible_at`]).
 pub const COMPACT_WIDTH_THRESHOLD: u16 = 100;
 
-/// Map the daemon's wire-stable `gpu_backend` label
-/// (`"nvidia"`/`"amd"`/...) to the recommender's per-backend key
-/// (`"cuda"`/`"hip"`/...). Kept here so the dialog stays decoupled
-/// from the daemon's sampler vocabulary. R113: `"unknown"` and
-/// `"unsampled"` pass through verbatim so `vram_fit_for_file` can
-/// return `FileFit::Unknown`.
 /// VRAM the fit math sizes against: the smallest card the ranked backend can
 /// actually use, which is what `init::detection::aggregate_vram_bytes` does and
 /// what a launch gets. The daemon's `gpu_mem_total_bytes` sums every device, so
@@ -71,6 +65,12 @@ fn ranked_vram_bytes(metrics: &HostMetricsSnapshot, backend: &str) -> Option<u64
   smallest.or(metrics.gpu_mem_total_bytes)
 }
 
+/// Map the daemon's wire-stable `gpu_backend` label
+/// (`"nvidia"`/`"amd"`/...) to the recommender's per-backend key
+/// (`"cuda"`/`"hip"`/...). Kept here so the dialog stays decoupled
+/// from the daemon's sampler vocabulary. R113: `"unknown"` and
+/// `"unsampled"` pass through verbatim so `vram_fit_for_file` can
+/// return `FileFit::Unknown`.
 fn recommender_backend_key(wire: &str) -> &'static str {
   use crate::daemon::host_metrics::HostMetricsSnapshot as H;
   match wire {
