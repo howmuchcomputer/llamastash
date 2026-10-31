@@ -13,7 +13,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::cli::cli_args::{BenchArgs, Cli, LaunchOverrides};
+use crate::cli::cli_args::{BenchArgs, Cli, LaunchMode, LaunchOverrides};
 use crate::cli::client::connect_or_spawn;
 use crate::cli::exit_codes::{CliExit, CliResult, LAUNCH_FAILED, UNKNOWN, USAGE};
 use crate::cli::format::table;
@@ -422,7 +422,9 @@ async fn tail(
     )
     .await
     .map_err(|e| format!("requests_tail: {e}"))?;
-  Ok(Tail::deserialize(&body).map(|t| t.rows).unwrap_or_default())
+  Tail::deserialize(&body)
+    .map(|t| t.rows)
+    .map_err(|e| format!("requests_tail: unreadable response: {e}"))
 }
 
 /// The row this run produced, once the proxy has finished it. A row scoped to the
@@ -554,6 +556,15 @@ async fn stop_live_of(client: &mut Client, path: &str) -> Vec<String> {
   stopped
 }
 
+/// A `--mode` that cannot answer the prompt bench sends. `--mode chat` is the one
+/// bench launches, so it is accepted like the `start` override it mirrors.
+fn non_chat_mode(mode: Option<LaunchMode>) -> Option<&'static str> {
+  match mode {
+    Some(m) if m != LaunchMode::Chat => Some(m.as_label()),
+    _ => None,
+  }
+}
+
 pub async fn handle(args: BenchArgs, cli: &Cli, config: &Config) -> CliResult {
   let mut client = connect_or_spawn(cli, config).await?;
   let catalog = fetch_catalog(&mut client).await?;
@@ -572,13 +583,10 @@ pub async fn handle(args: BenchArgs, cli: &Cli, config: &Config) -> CliResult {
       ),
     ));
   }
-  if let Some(mode) = args.overrides.mode {
+  if let Some(label) = non_chat_mode(args.overrides.mode) {
     return Err(CliExit::new(
       USAGE,
-      format!(
-        "bench sends chat requests; --mode {} is not chat",
-        mode.as_label()
-      ),
+      format!("bench sends chat requests; --mode {label} is not chat"),
     ));
   }
 
@@ -877,5 +885,18 @@ mod tests {
                    "mode": "chat", "state": "error" }],
     }));
     assert!(live_launch_of(&rows, "/m/m.gguf").is_none());
+  }
+
+  /// `--mode chat` is what bench launches, so only the other two are refused.
+  #[test]
+  fn only_a_non_chat_mode_override_is_refused() {
+    assert_eq!(non_chat_mode(None), None);
+    assert_eq!(non_chat_mode(Some(LaunchMode::Chat)), None);
+    assert_eq!(
+      non_chat_mode(Some(LaunchMode::Embedding)),
+      Some("embedding"),
+      "an embedding launch cannot answer the prompt"
+    );
+    assert_eq!(non_chat_mode(Some(LaunchMode::Rerank)), Some("rerank"));
   }
 }

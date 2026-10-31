@@ -271,17 +271,32 @@ pub(crate) async fn start_row_with_preset(
   mode: Option<CliLaunchMode>,
 ) -> Result<Value, CliExit> {
   let params = preset_baseline(client, row, preset).await?;
-  let selection = if preset.is_some() {
+  // The reserved `auto` is pure fit, so it selects like `start --preset auto`
+  // and stamps no preset name: an `auto` row would claim a preset that is the
+  // absence of one.
+  let pure_fit = preset == Some(crate::launch::presets::AUTO_DEFAULT);
+  let selection = if pure_fit {
+    "auto"
+  } else if preset.is_some() {
     "explicit"
   } else {
     "default"
   };
+  let stamped_preset = preset.filter(|p| *p != crate::launch::presets::AUTO_DEFAULT);
   let overrides = LaunchOverrides {
     mode,
     ..LaunchOverrides::default()
   };
   let payload = start_payload(
-    client, row, &params, &overrides, selection, preset, false, None, false,
+    client,
+    row,
+    &params,
+    &overrides,
+    selection,
+    stamped_preset,
+    false,
+    None,
+    false,
   )
   .await?;
   client

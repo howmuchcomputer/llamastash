@@ -41,6 +41,10 @@ fn free_port() -> u16 {
 /// model's file name, which is how a per-model `presets:` block names its model.
 const PRESETS: &str = "presets:\n  chat.gguf:\n    entries:\n      fast:\n        knobs:\n          ctx_size: 2048\n      slow:\n        knobs:\n          ctx_size: 4096\n";
 
+/// The two presets plus one that cannot answer a chat prompt: it pins the launch
+/// to embedding mode, so it fails after the load rather than at the parse.
+const BROKEN_PRESETS: &str = "presets:\n  chat.gguf:\n    entries:\n      sunk:\n        knobs:\n          mode: embedding\n      fast:\n        knobs:\n          ctx_size: 2048\n";
+
 /// A daemon with a chat model, an embedding model, and two saved presets.
 struct Daemon {
   state: PathBuf,
@@ -385,6 +389,49 @@ fn every_named_preset_gets_its_own_row_and_its_own_launch() {
   assert_eq!(daemon.running(), 0, "both launches were stopped");
 }
 
+/// A preset whose launch comes up as something other than chat is that row's
+/// error. The next preset is still measured, stdout stays parseable, and the
+/// failed launch is stopped like any other.
+#[test]
+fn a_preset_that_comes_up_non_chat_is_an_error_row_and_the_next_one_still_runs() {
+  let daemon = Daemon::start("non-chat-preset", BROKEN_PRESETS);
+  let out = daemon.try_run(&[
+    "bench",
+    "chat",
+    "--preset",
+    "sunk,fast",
+    "--runs",
+    "1",
+    "--prompt",
+    "__TEST_EMIT_TIMINGS__",
+    "--json",
+  ]);
+  assert_eq!(
+    out.status.code(),
+    Some(67),
+    "a preset with no numbers is LAUNCH_FAILED"
+  );
+  let body = stdout_json(&out);
+  let results = body["results"].as_array().expect("results array");
+  assert_eq!(results.len(), 2, "both presets were attempted: {body}");
+  assert_eq!(results[0]["preset"], "sunk");
+  let err = results[0]["error"].as_str().expect("an error row");
+  assert!(err.contains("embedding"), "names the mode: {err}");
+  assert!(
+    results[0]["tokens_per_second"].is_null(),
+    "a failed preset measures nothing: {}",
+    results[0]
+  );
+  assert_eq!(results[1]["preset"], "fast");
+  assert!(
+    results[1]["tokens_per_second"].is_number(),
+    "the next preset is still measured: {}",
+    results[1]
+  );
+  assert_eq!(results[1]["error"], serde_json::Value::Null);
+  assert_eq!(daemon.running(), 0, "the failed launch was stopped too");
+}
+
 /// An unknown preset name is a usage error raised before any launch, so a typo
 /// costs no model load.
 #[test]
@@ -411,6 +458,26 @@ fn a_model_that_already_runs_is_refused_and_left_alone() {
     stderr(&out)
   );
   assert_eq!(daemon.running(), 1, "the running launch is untouched");
+}
+
+/// `--mode chat` is what bench launches anyway, so it is accepted like every
+/// other `start` override. Only the modes that cannot answer the prompt are.
+#[test]
+fn the_chat_mode_override_is_accepted() {
+  let daemon = Daemon::plain("mode-chat");
+  let out = daemon.run(&[
+    "bench",
+    "chat",
+    "--mode",
+    "chat",
+    "--runs",
+    "1",
+    "--prompt",
+    "__TEST_EMIT_TIMINGS__",
+    "--json",
+  ]);
+  assert_eq!(only_result(&out)["tokens_per_second"], 38.64);
+  assert_eq!(daemon.running(), 0);
 }
 
 /// Only chat answers the prompt bench sends, so a non-chat row is refused up

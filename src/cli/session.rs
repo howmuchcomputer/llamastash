@@ -119,7 +119,7 @@ pub(crate) fn proxy_base_url(status: &StatusSnapshot) -> Result<String, CliExit>
     CliExit::new(
       DAEMON_UNREACHABLE,
       format!(
-        "the proxy is not listening ({state}); a session tool routes its model traffic through it"
+        "the proxy is not listening ({state}); this command routes its model traffic through it"
       ),
     )
   })
