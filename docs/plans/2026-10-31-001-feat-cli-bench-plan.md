@@ -131,7 +131,7 @@ Table columns: `PRESET  LOAD  PP tok/s  TG tok/s  TTFT  RUNS  NOTE` (NOTE holds 
 
 ## Implementation Units
 
-- [ ] **Unit 1: share `start`'s per-launch overrides**
+- [x] **Unit 1: share `start`'s per-launch overrides**
 
 **Goal:** One flattened args struct for the per-launch overrides and one function that turns (catalog row, preset baseline, overrides, preset name) into a `start_model` payload, used by `start` now and by `bench` in Unit 2.
 
@@ -157,7 +157,7 @@ Table columns: `PRESET  LOAD  PP tok/s  TG tok/s  TTFT  RUNS  NOTE` (NOTE holds 
 
 **Verification:** `start` behaves exactly as before; `cargo nextest run --features test-fixtures --lib start` and `--test start_model_ipc_test` pass.
 
-- [ ] **Unit 2: `llamastash bench` command**
+- [x] **Unit 2: `llamastash bench` command**
 
 **Goal:** The new verb, end to end.
 
@@ -199,7 +199,7 @@ Table columns: `PRESET  LOAD  PP tok/s  TG tok/s  TTFT  RUNS  NOTE` (NOTE holds 
 
 **Verification:** `cargo nextest run --features test-fixtures --lib bench` and `--test cli_bench` pass; manual E2E below shows real numbers.
 
-- [ ] **Unit 3: docs**
+- [x] **Unit 3: docs**
 
 **Goal:** Docs ship with the code.
 
