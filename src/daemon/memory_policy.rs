@@ -1,16 +1,13 @@
 //! Live admission policy, persisted before a changed reserve is published.
 
 use std::path::PathBuf;
-use std::sync::{
-  atomic::{AtomicU8, Ordering},
-  Arc,
-};
+use std::sync::{Arc, RwLock as SyncRwLock};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::daemon::host_metrics::HostMetricsSnapshot;
-use crate::launch::headroom::DEFAULT_APPLE_RESERVE_PERCENT;
+use crate::launch::{admission, headroom::MemoryReserve};
 
 #[derive(Clone)]
 pub struct MemoryPolicy {
@@ -18,45 +15,46 @@ pub struct MemoryPolicy {
 }
 
 struct Inner {
-  percent: AtomicU8,
+  reserve: SyncRwLock<MemoryReserve>,
   config_path: Option<PathBuf>,
   update: std::sync::Mutex<()>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryBudget {
-  pub apple_memory_reserve_percent: u8,
-  pub apple_unified: bool,
+  pub unified_memory_reserve_percent: MemoryReserve,
+  pub default_reserve_percent: Option<u8>,
+  pub unified: bool,
   pub available_bytes: Option<u64>,
   pub admissible_bytes: Option<u64>,
 }
 
 impl Default for MemoryPolicy {
   fn default() -> Self {
-    Self::new(DEFAULT_APPLE_RESERVE_PERCENT, None)
+    Self::new(MemoryReserve::AUTO, None)
   }
 }
 
 impl MemoryPolicy {
-  pub fn new(percent: u8, config_path: Option<PathBuf>) -> Self {
+  pub fn new(reserve: MemoryReserve, config_path: Option<PathBuf>) -> Self {
     Self {
       inner: Arc::new(Inner {
-        percent: AtomicU8::new(percent),
+        reserve: SyncRwLock::new(reserve),
         config_path,
         update: std::sync::Mutex::new(()),
       }),
     }
   }
 
-  pub fn percent(&self) -> u8 {
-    self.inner.percent.load(Ordering::Relaxed)
+  pub fn reserve(&self) -> MemoryReserve {
+    *self
+      .inner
+      .reserve
+      .read()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
   }
 
-  pub async fn set(&self, percent: u8) -> anyhow::Result<()> {
-    anyhow::ensure!(
-      percent <= 99,
-      "apple_memory_reserve_percent must be between 0 and 99"
-    );
+  pub async fn set(&self, reserve: MemoryReserve) -> anyhow::Result<()> {
     let inner = Arc::clone(&self.inner);
     // A disconnected caller must not leave the persisted and live policies apart.
     tokio::task::spawn_blocking(move || {
@@ -69,34 +67,58 @@ impl MemoryPolicy {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no config path is available; reserve was not changed"))?;
       let additions = yaml_serde::to_value(
-        serde_json::json!({"daemon": {"apple_memory_reserve_percent": percent}}),
+        serde_json::json!({"daemon": {"unified_memory_reserve_percent": reserve}}),
       )?;
       crate::config::writer::merge_and_write(path, additions)?;
-      inner.percent.store(percent, Ordering::Relaxed);
+      *inner
+        .reserve
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = reserve;
       Ok::<_, anyhow::Error>(())
     })
     .await?
   }
 
   pub async fn budget(&self, metrics: Option<&Arc<RwLock<HostMetricsSnapshot>>>) -> MemoryBudget {
-    let percent = self.percent();
-    let mut budget = MemoryBudget {
-      apple_memory_reserve_percent: percent,
-      apple_unified: false,
-      available_bytes: None,
+    let host = match metrics {
+      Some(metrics) => Some(metrics.read().await),
+      None => None,
+    };
+    MemoryBudget::from_snapshot(self.reserve(), host.as_deref())
+  }
+}
+
+impl MemoryBudget {
+  pub fn from_snapshot(reserve: MemoryReserve, host: Option<&HostMetricsSnapshot>) -> Self {
+    let default_reserve_percent = host
+      .filter(|h| admission::is_sampled(h))
+      .and_then(|h| admission::pool_kind(h).default_reserve_percent());
+    let available_bytes = host
+      .filter(|h| default_reserve_percent.is_some() && h.ram_total_bytes > 0)
+      .map(|h| admission::available_pool_bytes(h, false));
+    let mut budget = Self {
+      unified_memory_reserve_percent: reserve,
+      default_reserve_percent,
+      unified: default_reserve_percent.is_some(),
+      available_bytes,
       admissible_bytes: None,
     };
-    if let Some(metrics) = metrics {
-      let host = metrics.read().await;
-      budget.apple_unified = host.gpu_backend == HostMetricsSnapshot::BACKEND_APPLE_METAL;
-      if budget.apple_unified && host.ram_total_bytes > 0 {
-        budget.available_bytes = Some(host.ram_total_bytes.saturating_sub(host.ram_used_bytes));
-        budget.admissible_bytes = Some(crate::launch::admission::effective_free_bytes(
-          &host, percent,
-        ));
-      }
-    }
+    budget.admissible_bytes = budget.preview(reserve);
     budget
+  }
+
+  pub fn supports_editing(&self) -> bool {
+    self.unified
+      && self
+        .default_reserve_percent
+        .is_some_and(|percent| percent <= 99)
+  }
+
+  pub fn preview(&self, reserve: MemoryReserve) -> Option<u64> {
+    self
+      .available_bytes
+      .zip(self.default_reserve_percent.filter(|p| *p <= 99))
+      .map(|(available, default)| reserve.admissible_bytes(available, default))
   }
 }
 
@@ -104,13 +126,106 @@ impl MemoryPolicy {
 mod tests {
   use super::*;
 
+  #[test]
+  fn snapshot_preview_matches_admission_for_each_pool_and_missing_samples() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    for (backend, unified, default) in [
+      (HostMetricsSnapshot::BACKEND_APPLE_METAL, false, Some(25)),
+      (HostMetricsSnapshot::BACKEND_AMD, true, Some(0)),
+      (HostMetricsSnapshot::BACKEND_NVIDIA, true, Some(0)),
+      (HostMetricsSnapshot::BACKEND_UNKNOWN, true, Some(0)),
+      (HostMetricsSnapshot::BACKEND_NVIDIA, false, None),
+      (HostMetricsSnapshot::BACKEND_CPU_ONLY, false, None),
+      (HostMetricsSnapshot::UNINITIALIZED_BACKEND, true, None),
+    ] {
+      for used in [24 * GIB, 64 * GIB, 65 * GIB] {
+        let host = HostMetricsSnapshot {
+          gpu_backend: backend.into(),
+          unified,
+          ram_total_bytes: 64 * GIB,
+          ram_used_bytes: used,
+          uma_shared_total_bytes: Some(32 * GIB),
+          uma_shared_used_bytes: Some(12 * GIB),
+          ..Default::default()
+        };
+        for reserve in [
+          MemoryReserve::AUTO,
+          MemoryReserve::percent(0).unwrap(),
+          MemoryReserve::percent(10).unwrap(),
+          MemoryReserve::percent(99).unwrap(),
+        ] {
+          let budget = MemoryBudget::from_snapshot(reserve, Some(&host));
+          assert_eq!(budget.default_reserve_percent, default);
+          assert_eq!(budget.supports_editing(), default.is_some());
+          assert_eq!(budget.preview(reserve), budget.admissible_bytes);
+          if default.is_some() {
+            assert_eq!(
+              budget.available_bytes,
+              Some((64 * GIB).saturating_sub(used).min(20 * GIB))
+            );
+            assert_eq!(
+              budget.admissible_bytes,
+              Some(admission::effective_free_bytes(&host, reserve))
+            );
+          } else {
+            assert_eq!(budget.available_bytes, None);
+            assert_eq!(budget.admissible_bytes, None);
+          }
+        }
+      }
+    }
+    for host in [None, Some(&HostMetricsSnapshot::default())] {
+      let budget = MemoryBudget::from_snapshot(MemoryReserve::AUTO, host);
+      assert!(!budget.supports_editing());
+      assert_eq!(budget.admissible_bytes, None);
+    }
+  }
+
+  #[tokio::test]
+  async fn reset_to_auto_survives_reload_and_concurrent_preset_edits() {
+    let dir = crate::util::test_temp::unique_temp_dir("memory-policy-concurrent");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.yaml");
+    std::fs::write(
+      &path,
+      "# preserve me\ndaemon:\n  unified_memory_reserve_percent: 10\n",
+    )
+    .unwrap();
+    let policy = MemoryPolicy::new(MemoryReserve::percent(10).unwrap(), Some(path.clone()));
+    let preset_path = path.clone();
+    let preset = tokio::task::spawn_blocking(move || {
+      crate::config::presets_writer::upsert_preset(
+        &preset_path,
+        "model",
+        "test",
+        &serde_json::json!({"knobs": {"ctx-size": 1024}}),
+      )
+    });
+    let (save, preset_result) = tokio::join!(policy.set(MemoryReserve::AUTO), preset);
+    save.unwrap();
+    preset_result.unwrap().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("# preserve me"));
+    let config: crate::config::Config = yaml_serde::from_str(&text).unwrap();
+    assert_eq!(
+      config.daemon.unified_memory_reserve_percent,
+      MemoryReserve::AUTO
+    );
+    assert_eq!(policy.reserve(), MemoryReserve::AUTO);
+    assert!(config.presets["model"].entries.contains_key("test"));
+    std::fs::remove_dir_all(dir).unwrap();
+  }
+
   #[tokio::test]
   async fn a_failed_write_does_not_change_live_admission() {
     let policy = MemoryPolicy::default();
-    assert!(policy.set(10).await.is_err());
-    assert_eq!(policy.percent(), 25);
-    assert!(policy.set(100).await.is_err());
-    assert_eq!(policy.percent(), 25);
+    assert!(policy
+      .set(MemoryReserve::percent(10).unwrap())
+      .await
+      .is_err());
+    assert_eq!(policy.reserve(), MemoryReserve::AUTO);
+    assert!(MemoryReserve::percent(100).is_err());
+    assert_eq!(policy.reserve(), MemoryReserve::AUTO);
   }
 
   #[tokio::test]
@@ -123,13 +238,19 @@ mod tests {
       "# keep this\ndaemon:\n  probe_timeout_secs: 300 # keep too\n",
     )
     .unwrap();
-    let policy = MemoryPolicy::new(25, Some(path.clone()));
-    policy.set(10).await.unwrap();
-    assert_eq!(policy.percent(), 10);
+    let policy = MemoryPolicy::new(MemoryReserve::AUTO, Some(path.clone()));
+    policy
+      .set(MemoryReserve::percent(10).unwrap())
+      .await
+      .unwrap();
+    assert_eq!(policy.reserve(), MemoryReserve::percent(10).unwrap());
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("# keep this") && text.contains("# keep too"));
     let config: crate::config::Config = yaml_serde::from_str(&text).unwrap();
-    assert_eq!(config.daemon.apple_memory_reserve_percent, 10);
+    assert_eq!(
+      config.daemon.unified_memory_reserve_percent,
+      MemoryReserve::percent(10).unwrap()
+    );
     assert_eq!(config.daemon.probe_timeout_secs, 300);
     std::fs::remove_dir_all(dir).unwrap();
   }
@@ -142,7 +263,7 @@ mod tests {
     let dir = crate::util::test_temp::unique_temp_dir("memory-reserve-cancel");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.yaml");
-    let policy = MemoryPolicy::new(25, Some(path.clone()));
+    let policy = MemoryPolicy::new(MemoryReserve::AUTO, Some(path.clone()));
     let (locked_tx, locked_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let holder = std::thread::spawn(move || {
@@ -152,7 +273,7 @@ mod tests {
     });
     locked_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     let saving = policy.clone();
-    let caller = tokio::spawn(async move { saving.set(10).await });
+    let caller = tokio::spawn(async move { saving.set(MemoryReserve::percent(10).unwrap()).await });
     tokio::time::timeout(Duration::from_secs(3), async {
       while policy.inner.update.try_lock().is_ok() {
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -165,7 +286,7 @@ mod tests {
     release_tx.send(()).unwrap();
     holder.join().unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
-      while policy.percent() != 10 {
+      while policy.reserve() != MemoryReserve::percent(10).unwrap() {
         tokio::time::sleep(Duration::from_millis(5)).await;
       }
     })
@@ -173,7 +294,10 @@ mod tests {
     .unwrap();
     let config: crate::config::Config =
       yaml_serde::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    assert_eq!(config.daemon.apple_memory_reserve_percent, policy.percent());
+    assert_eq!(
+      config.daemon.unified_memory_reserve_percent,
+      policy.reserve()
+    );
     std::fs::remove_dir_all(dir).unwrap();
   }
 
@@ -184,9 +308,12 @@ mod tests {
     let path = dir.join("config.yaml");
     let original = "daemon: [invalid-container]\n";
     std::fs::write(&path, original).unwrap();
-    let policy = MemoryPolicy::new(25, Some(path.clone()));
-    assert!(policy.set(10).await.is_err());
-    assert_eq!(policy.percent(), 25);
+    let policy = MemoryPolicy::new(MemoryReserve::AUTO, Some(path.clone()));
+    assert!(policy
+      .set(MemoryReserve::percent(10).unwrap())
+      .await
+      .is_err());
+    assert_eq!(policy.reserve(), MemoryReserve::AUTO);
     assert_eq!(std::fs::read_to_string(path).unwrap(), original);
     std::fs::remove_dir_all(dir).unwrap();
   }
@@ -202,7 +329,7 @@ mod tests {
     let path = dir.join("config.yaml");
     std::fs::write(&path, "theme: latte # keep\n").unwrap();
     let mut ctx = MethodContext::new(ShutdownToken::new())
-      .with_memory_policy(MemoryPolicy::new(25, Some(path.clone())));
+      .with_memory_policy(MemoryPolicy::new(MemoryReserve::AUTO, Some(path.clone())));
     ctx.host_metrics = Some(Arc::new(RwLock::new(HostMetricsSnapshot {
       gpu_backend: HostMetricsSnapshot::BACKEND_APPLE_METAL.into(),
       unified: true,
@@ -212,40 +339,49 @@ mod tests {
     })));
     for params in [
       json!({}),
-      json!({"apple_memory_reserve_percent": 100}),
-      json!({"apple_memory_reserve_percent": -1}),
-      json!({"apple_memory_reserve_percent": 10.5}),
-      json!({"apple_memory_reserve_percent": 10, "typo": true}),
+      json!({"unified_memory_reserve_percent": 100}),
+      json!({"unified_memory_reserve_percent": -1}),
+      json!({"unified_memory_reserve_percent": 10.5}),
+      json!({"unified_memory_reserve_percent": null}),
+      json!({"unified_memory_reserve_percent": "10"}),
+      json!({"unified_memory_reserve_percent": true}),
+      json!({"unified_memory_reserve_percent": 10, "typo": true}),
     ] {
       let response =
         dispatch_request(&ctx, Request::new(1, "memory_reserve_set", Some(params))).await;
       assert_eq!(response.error.unwrap().code, -32602);
-      assert_eq!(ctx.memory_policy.percent(), 25);
+      assert_eq!(ctx.memory_policy.reserve(), MemoryReserve::AUTO);
     }
     let snapshot = ctx.host_metrics.as_ref().unwrap().read().await.clone();
     let demand = 34 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
     let before =
-      crate::launch::admission::effective_free_bytes(&snapshot, ctx.memory_policy.percent());
+      crate::launch::admission::effective_free_bytes(&snapshot, ctx.memory_policy.reserve());
     assert!(ctx.admission.try_admit(1, demand, before).is_err());
     let response = dispatch_request(
       &ctx,
       Request::new(
         2,
         "memory_reserve_set",
-        Some(json!({"apple_memory_reserve_percent": 10})),
+        Some(json!({"unified_memory_reserve_percent": 10})),
       ),
     )
     .await;
     assert!(response.error.is_none(), "{response:?}");
+    let saved: MemoryBudget = serde_json::from_value(response.result.unwrap()).unwrap();
+    assert!(saved.supports_editing());
+    assert_eq!(
+      saved.unified_memory_reserve_percent,
+      MemoryReserve::percent(10).unwrap()
+    );
     let after =
-      crate::launch::admission::effective_free_bytes(&snapshot, ctx.memory_policy.percent());
+      crate::launch::admission::effective_free_bytes(&snapshot, ctx.memory_policy.reserve());
     assert!(ctx.admission.try_admit(2, demand, after).is_ok());
     let status = dispatch_request(&ctx, Request::new(3, "status", None))
       .await
       .result
       .unwrap();
     assert_eq!(
-      status["daemon"]["memory"]["apple_memory_reserve_percent"],
+      status["daemon"]["memory"]["unified_memory_reserve_percent"],
       10
     );
     assert_eq!(
@@ -254,7 +390,10 @@ mod tests {
     );
     let reloaded: crate::config::Config =
       yaml_serde::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    assert_eq!(reloaded.daemon.apple_memory_reserve_percent, 10);
+    assert_eq!(
+      reloaded.daemon.unified_memory_reserve_percent,
+      MemoryReserve::percent(10).unwrap()
+    );
     std::fs::remove_dir_all(dir).unwrap();
   }
 }

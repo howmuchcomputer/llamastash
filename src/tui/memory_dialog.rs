@@ -10,6 +10,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::daemon::memory_policy::MemoryBudget;
+use crate::launch::headroom::MemoryReserve;
 use crate::theme::Palette;
 use crate::tui::{
   app::App,
@@ -25,8 +26,8 @@ pub struct MemoryDialog {
 }
 
 impl MemoryDialog {
-  pub fn open(percent: u8) -> Self {
-    let mut input = InputField::with_text(percent.to_string());
+  pub fn open(reserve: MemoryReserve) -> Self {
+    let mut input = InputField::with_text(reserve.to_string());
     input.enter_edit();
     Self {
       input,
@@ -35,34 +36,25 @@ impl MemoryDialog {
     }
   }
 
-  pub fn percent(&self) -> Result<u8, &'static str> {
-    self
-      .input
-      .buffer()
-      .trim()
-      .parse::<u8>()
-      .ok()
-      .filter(|p| *p <= 99)
-      .ok_or("Enter a whole percentage from 0 to 99.")
+  pub fn reserve(&self) -> Result<MemoryReserve, &'static str> {
+    self.input.buffer().trim().parse()
   }
 }
 
 fn preview_lines(
   budget: Option<&MemoryBudget>,
-  percent: Option<u8>,
+  reserve: Option<MemoryReserve>,
   width: u16,
   palette: &Palette,
 ) -> Vec<Line<'static>> {
   let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / 1073741824.0);
   let glyphs = crate::tui::glyphs::active();
   let available = budget.and_then(|b| b.available_bytes);
-  let estimate = available.zip(percent).map(|(free, reserve)| {
-    let admissible = crate::launch::headroom::admissible_bytes(
-      free,
-      crate::launch::headroom::PoolKind::AppleUnified,
-      reserve,
-    );
-    (free.saturating_sub(admissible), admissible)
+  let estimate = budget.zip(reserve).and_then(|(budget, setting)| {
+    budget
+      .available_bytes
+      .zip(budget.preview(setting))
+      .map(|(free, admissible)| (free.saturating_sub(admissible), admissible))
   });
   let metric = |label: &str, value: Option<String>, style, bold| {
     let style = if value.is_some() {
@@ -85,9 +77,10 @@ fn preview_lines(
       Span::styled(value, style),
     ])
   };
-  let bar = match available.zip(percent) {
-    Some((free, reserve)) if free > 0 => {
-      let launch_cells = (usize::from(width) * usize::from(100 - reserve) + 50) / 100;
+  let bar = match available.zip(reserve.zip(budget.and_then(|b| b.default_reserve_percent))) {
+    Some((free, (setting, default))) if free > 0 => {
+      let reserve_percent = setting.resolve(default);
+      let launch_cells = (usize::from(width) * usize::from(100 - reserve_percent) + 50) / 100;
       Line::from(vec![
         Span::styled(
           glyphs.gauge_fill().to_string().repeat(launch_cells),
@@ -113,14 +106,14 @@ fn preview_lines(
       palette.label_style().add_modifier(Modifier::BOLD),
     ),
     metric(
-      "Available RAM",
+      "Available pool",
       available.map(gib),
       palette.text_style(),
       false,
     ),
     metric(
-      "Extra reserve",
-      estimate.map(|(reserve, _)| format!("- {}", gib(reserve))),
+      "Additional reserve",
+      estimate.map(|(reserved_bytes, _)| format!("- {}", gib(reserved_bytes))),
       palette.warning_style(),
       false,
     ),
@@ -129,7 +122,7 @@ fn preview_lines(
       palette.muted_style(),
     ),
     metric(
-      "Launch budget",
+      "Admission budget",
       estimate.map(|(_, admissible)| gib(admissible)),
       palette.success_style().add_modifier(Modifier::BOLD),
       true,
@@ -176,7 +169,7 @@ pub fn render(
   let block = palette
     .panel()
     .title(Line::styled(
-      " Apple Silicon memory reserve ",
+      " Unified memory reserve ",
       palette.title_style(),
     ))
     .padding(Padding::new(2, 2, u16::from(!compact), u16::from(!compact)))
@@ -220,16 +213,16 @@ pub fn render(
         .style(tone.bg(palette.selection).add_modifier(Modifier::BOLD)),
       field,
     );
-    frame.render_widget(
-      Paragraph::new(Span::styled("%", palette.text_style())),
-      Rect::new(field.right() + 1, field.y, 1, 1),
-    );
     if inner.width >= 32 {
       frame.render_widget(
         Paragraph::new(Span::styled(
           format!(
             "Default {}%",
-            crate::launch::headroom::DEFAULT_APPLE_RESERVE_PERCENT
+            app
+              .memory_budget
+              .as_ref()
+              .and_then(|b| b.default_reserve_percent)
+              .unwrap_or(0)
           ),
           palette.muted_style(),
         )),
@@ -239,7 +232,7 @@ pub fn render(
     if !compact {
       frame.render_widget(
         Paragraph::new(Span::styled(
-          "of available RAM  /  0-99%",
+          "of available pool  /  auto or 0-99%",
           palette.muted_style(),
         )),
         Rect::new(inner.x, inner.y + 1, inner.width, 1),
@@ -247,7 +240,7 @@ pub fn render(
     }
     let mut preview = preview_lines(
       app.memory_budget.as_ref(),
-      dialog.percent().ok(),
+      dialog.reserve().ok(),
       inner.width,
       palette,
     );
@@ -258,7 +251,7 @@ pub fn render(
     frame.render_widget(Paragraph::new(preview), chunks[2]);
     frame.render_widget(
       Paragraph::new(vec![
-        Line::from("Open apps are already counted as used."),
+        Line::from("Engine limits and launch reservations also apply."),
         Line::from("Save applies to new launches; kept for next time."),
       ])
       .style(palette.muted_style()),
@@ -266,9 +259,9 @@ pub fn render(
     );
     let status = if let Some(error) = dialog.error.as_ref() {
       Line::styled(format!("Cannot save: {error}"), palette.error_style())
-    } else if dialog.percent().is_err() {
+    } else if dialog.reserve().is_err() {
       Line::styled(
-        "Enter a whole percentage (0-99) to preview.",
+        "Enter auto or a percentage (0-99) to preview.",
         palette.muted_style(),
       )
     } else if app
@@ -278,7 +271,7 @@ pub fn render(
       .is_none()
     {
       Line::styled(
-        "Waiting for an Apple Silicon memory reading.",
+        "Waiting for a unified-memory reading.",
         palette.muted_style(),
       )
     } else {
@@ -342,25 +335,38 @@ mod tests {
   #[test]
   fn editor_rejects_out_of_range_and_fractional_reserves() {
     for text in ["", "100", "-1", "10.5", "oops"] {
-      let mut dialog = MemoryDialog::open(25);
+      let mut dialog = MemoryDialog::open(MemoryReserve::percent(25).unwrap());
       dialog.input.set_text(text);
-      assert!(dialog.percent().is_err(), "{text}");
+      assert!(dialog.reserve().is_err(), "{text}");
     }
+    assert_eq!(
+      MemoryDialog::open(MemoryReserve::AUTO).reserve(),
+      Ok(MemoryReserve::AUTO)
+    );
     for percent in [0, 10, 25, 99] {
-      assert_eq!(MemoryDialog::open(percent).percent(), Ok(percent));
+      assert_eq!(
+        MemoryDialog::open(MemoryReserve::percent(percent).unwrap()).reserve(),
+        Ok(MemoryReserve::percent(percent).unwrap())
+      );
     }
   }
 
   #[test]
   fn preview_reserves_from_available_rather_than_total_ram() {
     let budget = MemoryBudget {
-      apple_memory_reserve_percent: 25,
-      apple_unified: true,
+      unified_memory_reserve_percent: MemoryReserve::AUTO,
+      default_reserve_percent: Some(25),
+      unified: true,
       available_bytes: Some(40 * 1024 * 1024 * 1024),
       admissible_bytes: Some(30 * 1024 * 1024 * 1024),
     };
     let palette = crate::theme::palette_for(crate::theme::ThemeName::Macchiato);
-    let lines = preview_lines(Some(&budget), Some(10), 52, palette);
+    let lines = preview_lines(
+      Some(&budget),
+      Some(MemoryReserve::percent(10).unwrap()),
+      52,
+      palette,
+    );
     assert!(lines[2].to_string().contains("4.0 GiB"));
     assert!(lines[4].to_string().contains("36.0 GiB"));
     let invalid = preview_lines(Some(&budget), None, 52, palette);
@@ -389,12 +395,13 @@ mod tests {
         ..Default::default()
       });
       app.memory_budget = Some(MemoryBudget {
-        apple_memory_reserve_percent: 25,
-        apple_unified: true,
+        unified_memory_reserve_percent: MemoryReserve::AUTO,
+        default_reserve_percent: Some(25),
+        unified: true,
         available_bytes: Some(40 * 1024 * 1024 * 1024),
         admissible_bytes: Some(30 * 1024 * 1024 * 1024),
       });
-      let mut dialog = MemoryDialog::open(10);
+      let mut dialog = MemoryDialog::open(MemoryReserve::percent(10).unwrap());
       dialog.error = Some("Permission denied; try again.".into());
       let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
       let drawn = terminal
@@ -415,7 +422,7 @@ mod tests {
         .map(|cell| cell.symbol())
         .collect::<String>();
       for required in [
-        "Launch budget",
+        "Admission budget",
         "36.0 GiB",
         "Cannot save:",
         "F2",
@@ -434,7 +441,7 @@ mod tests {
   #[test]
   fn long_wide_input_keeps_its_cursor_inside_the_field() {
     let app = App::new(AppOptions::default());
-    let mut dialog = MemoryDialog::open(25);
+    let mut dialog = MemoryDialog::open(MemoryReserve::percent(25).unwrap());
     dialog.input.set_text("bad input 日本語999");
     let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
     terminal

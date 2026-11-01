@@ -15,7 +15,9 @@ use crate::tui::delete::DeleteOutcome;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::daemon::memory_policy::MemoryBudget;
 use crate::ipc::Client;
+use crate::launch::headroom::MemoryReserve;
 use crate::tui::app::{App, ConfirmAction};
 use crate::tui::hf_pull::{
   apply_cancel_download, apply_download_event, apply_hf_dialog_event, apply_open_hf_dialog,
@@ -132,7 +134,7 @@ pub enum WriterCmd {
   /// `presets_all` refresh reflects it. Boxed (like `StartModel`) so the
   /// large `crate::launch::knobs::KnobSet` doesn't bloat the other tiny variants.
   SavePreset(Box<SavePresetCmd>),
-  SetMemoryReserve(u8),
+  SetMemoryReserve(MemoryReserve),
   /// `forget_models` — after a delete, so the next `list_models` refresh
   /// does not bring the deleted rows back before the daemon rescans.
   ForgetModels(Vec<PathBuf>),
@@ -677,15 +679,15 @@ fn apply_action(app: &mut App, action: Action, writer: Option<&mpsc::Sender<Writ
       match app
         .memory_budget
         .as_ref()
-        .filter(|budget| budget.apple_unified)
+        .filter(|budget| budget.supports_editing())
       {
         Some(budget) => {
           app.memory_dialog = Some(crate::tui::memory_dialog::MemoryDialog::open(
-            budget.apple_memory_reserve_percent,
+            budget.unified_memory_reserve_percent,
           ))
         }
         None => app.show_error_toast(
-          "Memory reserve editing requires an Apple Silicon daemon with memory-policy support.",
+          "Memory reserve editing requires a unified-memory daemon with policy support.",
         ),
       }
     }
@@ -1312,7 +1314,7 @@ fn handle_memory_reserve_input(
     return;
   }
   if action == Some(Action::Submit) {
-    match dialog.percent() {
+    match dialog.reserve() {
       Err(message) => dialog.error = Some(message.into()),
       Ok(percent) => match writer {
         Some(tx) => match tx.try_send(WriterCmd::SetMemoryReserve(percent)) {
@@ -2044,7 +2046,7 @@ fn build_yank_text(app: &App, action: Action) -> Option<String> {
 /// snapshots and forwards them as `RefreshTick`s to the run loop.
 #[derive(Debug)]
 pub enum RefreshTick {
-  MemoryReserveSaved(u8),
+  MemoryReserveSaved(MemoryBudget),
   Catalog(Value),
   Status(Value),
   Favorites(Value),
@@ -2209,14 +2211,9 @@ pub fn spawn_writer(
         Ok(resp) => {
           if method == "memory_reserve_set" {
             if let Some(fb) = &feedback {
-              if let Some(percent) = resp
-                .get("apple_memory_reserve_percent")
-                .and_then(Value::as_u64)
-                .and_then(|p| u8::try_from(p).ok())
-                .filter(|p| *p <= 99)
-              {
+              if let Ok(budget) = serde_json::from_value::<MemoryBudget>(resp.clone()) {
                 let _ = fb
-                  .send(Event::Refresh(RefreshTick::MemoryReserveSaved(percent)))
+                  .send(Event::Refresh(RefreshTick::MemoryReserveSaved(budget)))
                   .await;
               } else {
                 let _ = fb
@@ -2410,7 +2407,7 @@ pub fn encode_writer_cmd(cmd: WriterCmd) -> (&'static str, Value) {
     }
     WriterCmd::SetMemoryReserve(percent) => (
       "memory_reserve_set",
-      json!({"apple_memory_reserve_percent": percent}),
+      json!({"unified_memory_reserve_percent": percent}),
     ),
     WriterCmd::FavoriteAdd(p) => ("favorite_add", json!({ "model_path": p })),
     WriterCmd::FavoriteRemove(p) => ("favorite_remove", json!({ "model_path": p })),
@@ -2771,17 +2768,8 @@ fn apply_refresh(app: &mut App, tick: RefreshTick) {
       // batch that did start keep theirs.
       app.show_error_toast(writer_error_toast(method, &message));
     }
-    RefreshTick::MemoryReserveSaved(percent) => {
-      if let Some(budget) = app.memory_budget.as_mut() {
-        budget.apple_memory_reserve_percent = percent;
-        budget.admissible_bytes = budget.available_bytes.map(|available| {
-          crate::launch::headroom::admissible_bytes(
-            available,
-            crate::launch::headroom::PoolKind::AppleUnified,
-            percent,
-          )
-        });
-      }
+    RefreshTick::MemoryReserveSaved(budget) => {
+      app.memory_budget = Some(budget);
       app.memory_dialog = None;
       app.show_toast("Memory reserve saved; applies to future launches immediately.");
     }
@@ -3034,11 +3022,59 @@ mod tests {
   use crossterm::event::{KeyEvent, KeyModifiers};
 
   #[test]
+  fn reserve_editor_uses_uma_support_and_auto_survives_encoding() {
+    for backend in ["apple_metal", "amd", "nvidia", "unknown"] {
+      let host = crate::daemon::host_metrics::HostMetricsSnapshot {
+        gpu_backend: backend.into(),
+        unified: true,
+        ram_total_bytes: 64 * 1024 * 1024 * 1024,
+        ..Default::default()
+      };
+      let mut app = App::new(AppOptions::default());
+      app.memory_budget = Some(MemoryBudget::from_snapshot(
+        MemoryReserve::AUTO,
+        Some(&host),
+      ));
+      handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        None,
+      );
+      assert_eq!(
+        app.memory_dialog.as_ref().unwrap().reserve(),
+        Ok(MemoryReserve::AUTO)
+      );
+    }
+    let (method, params) = encode_writer_cmd(WriterCmd::SetMemoryReserve(MemoryReserve::AUTO));
+    assert_eq!(method, "memory_reserve_set");
+    assert_eq!(
+      params,
+      serde_json::json!({"unified_memory_reserve_percent": "auto"})
+    );
+    for memory in [
+      serde_json::Value::Null,
+      serde_json::json!({"apple_memory_reserve_percent": 25, "apple_unified": true}),
+      serde_json::json!({"unified_memory_reserve_percent": "auto", "unified": false}),
+      serde_json::json!({"unified_memory_reserve_percent": "auto", "unified": true, "default_reserve_percent": 255}),
+    ] {
+      let mut app = App::new(AppOptions::default());
+      app.ingest_status(&serde_json::json!({"daemon": {"memory": memory}}));
+      handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        None,
+      );
+      assert!(app.memory_dialog.is_none());
+    }
+  }
+
+  #[test]
   fn memory_reserve_editor_waits_for_persisted_success() {
     let mut app = App::new(AppOptions::default());
     app.memory_budget = Some(crate::daemon::memory_policy::MemoryBudget {
-      apple_memory_reserve_percent: 25,
-      apple_unified: true,
+      unified_memory_reserve_percent: MemoryReserve::AUTO,
+      default_reserve_percent: Some(25),
+      unified: true,
       available_bytes: Some(40 * 1024 * 1024 * 1024),
       admissible_bytes: Some(30 * 1024 * 1024 * 1024),
     });
@@ -3063,7 +3099,9 @@ mod tests {
       KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
       Some(&tx),
     );
-    assert!(matches!(rx.try_recv(), Ok(WriterCmd::SetMemoryReserve(10))));
+    assert!(
+      matches!(rx.try_recv(), Ok(WriterCmd::SetMemoryReserve(value)) if value == MemoryReserve::percent(10).unwrap())
+    );
     assert!(app.memory_dialog.as_ref().unwrap().saving);
     apply_refresh(
       &mut app,
@@ -3081,14 +3119,20 @@ mod tests {
       .as_ref()
       .unwrap()
       .contains("permission denied"));
-    apply_refresh(&mut app, RefreshTick::MemoryReserveSaved(10));
+    let mut saved = app.memory_budget.clone().unwrap();
+    saved.unified_memory_reserve_percent = MemoryReserve::percent(10).unwrap();
+    saved.admissible_bytes = saved.preview(saved.unified_memory_reserve_percent);
+    apply_refresh(&mut app, RefreshTick::MemoryReserveSaved(saved.clone()));
+    assert_eq!(app.memory_budget, Some(saved));
     assert!(app.memory_dialog.is_none());
   }
 
   #[test]
   fn memory_reserve_editor_cancel_dispatches_nothing() {
     let mut app = App::new(AppOptions::default());
-    app.memory_dialog = Some(crate::tui::memory_dialog::MemoryDialog::open(25));
+    app.memory_dialog = Some(crate::tui::memory_dialog::MemoryDialog::open(
+      MemoryReserve::percent(25).unwrap(),
+    ));
     let (tx, mut rx) = mpsc::channel(4);
     handle_key(
       &mut app,

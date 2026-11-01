@@ -211,7 +211,7 @@ fn resolved_chips(app: &App) -> Vec<RankedChip> {
         || app
           .memory_budget
           .as_ref()
-          .is_some_and(|budget| budget.apple_unified)
+          .is_some_and(|budget| budget.supports_editing())
     })
     .filter_map(|chip| {
       chip_keys(app, chip)

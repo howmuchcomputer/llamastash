@@ -192,7 +192,7 @@ Bare letters are for tool actions (`f` favorite, `e` edit, `u/c/p` yank, `t` the
 | `clear_filter`                          | `Esc`                             | Filter input                                                                       |
 | `toggle_favorite`                       | `f`                               | List                                                                               |
 | `open_launch_picker`                    | `Enter`                           | List                                                                               |
-| `open_memory_reserve` | `m` · `alt+m` | Nav focuses — Apple Silicon memory reserve editor |
+| `open_memory_reserve` | `m` · `alt+m` | Nav focuses — unified-memory reserve editor |
 | `open_hf_dialog`                        | `shift+p`                         | List — "Pull" mnemonic                                                             |
 | `submit`                                | `Enter`                           | Filter, right pane, embed, rerank, confirm popup, HF dialog                        |
 | `cancel`                                | `Esc`                             | Confirm popup, HF dialog                                                           |
@@ -443,40 +443,57 @@ The last three rows are the deliberate difference from `config.yaml`, where each
 
 YAML merge keys work: `<<: *base` is expanded before the file is validated or parsed, so a shared anchor contributes its knobs to the entry that merges it, and a typo riding in through an anchor is caught like any other. Merges are shallow, per key, as YAML defines them — an entry with its own `knobs:` map replaces the anchor's rather than extending it.
 
-#### Memory reserve on Apple Silicon
+#### Memory reserve on unified-memory hosts
 
-LlamaStash reserves 25% of currently available RAM before admitting a launch
-on Apple Silicon. This is an additional margin: running applications are
-already counted as used. It is a conservative default, not a Metal hardware
-limit. The engine's own memory limits, the model estimate (including compute
-overhead), and reservations for other launches remain separate.
+`daemon.unified_memory_reserve_percent` controls additional admission headroom
+on detected unified-memory (UMA) hosts. The default, `auto`, preserves the
+existing policy: **25% on Apple Silicon**, **0% additional reserve on other
+UMA hosts**, including AMD/Intel integrated GPUs and NVIDIA coherent UMA.
+An integer **0–99** overrides that percentage. Discrete GPU and CPU-only hosts
+are unaffected.
 
-From the Models list or right pane, **m** opens the
-memory reserve editor. Enter a whole percentage from **0 to 99** in the
-highlighted reserve field. The live breakdown separates available RAM, the
-additional reserve and the resulting launch budget; a bar shows their shares.
-Invalid input leaves the estimate blank until corrected. Enter saves; Esc
-cancels (both follow the configured submit/cancel bindings). A save preserves
-comments in `config.yaml` and changes admission
-for future CLI, TUI and proxy launches immediately, without restarting the
-daemon or its running models. Recent failed auto-starts can still be in the
-proxy's normal retry cooldown; changing the reserve does not clear it.
+The percentage is taken from the available **pool**, after existing GPU limits
+have been applied. For example, 40 GiB available with a 10% reserve gives a
+36 GiB admission budget. On a GTT-limited host, 80 GiB of available RAM but only
+20 GiB of available GTT gives an 18 GiB budget at 10%. Existing applications
+are already counted as used. This headroom is a policy margin, not a change to
+the driver's allocation ceiling.
 
-**Alt+M** is an alternate shortcut. In macOS Terminal, this alias requires
+From the Models list or right pane, **m** opens the memory reserve editor.
+Enter `auto` to restore the platform default, or a whole percentage from 0 to
+99. The highlighted field previews available pool memory, additional reserve,
+and admission budget. Invalid input leaves the estimate blank. Enter saves;
+Esc cancels (both follow the configured bindings). Saves preserve config
+comments and apply to future CLI, TUI, and proxy launches immediately, without
+restarting the daemon or its running models. A failed save leaves the live
+policy unchanged. Recent failed auto-starts can still be in the normal proxy
+retry cooldown; saving does not clear it.
+
+**Alt+M** remains an alias. In macOS Terminal, it requires
 [Use Option as Meta key](https://support.apple.com/guide/terminal/trmlkbrd/mac);
-plain **m** works without changing the terminal's keyboard settings. Neither
-shortcut captures text typed into the filter or a chat input.
+plain **m** needs no terminal change. Neither captures text typed into a filter
+or chat input. The editor is unavailable without compatible daemon policy data
+or on a host not detected as UMA.
 
 ```yaml
 daemon:
-  apple_memory_reserve_percent: 25
+  unified_memory_reserve_percent: auto # or an integer 0..99
 ```
 
-Hand-editing this key requires a daemon restart. It has no effect on other
-platforms. `0` removes the percentage reserve while retaining demand checks
-and in-flight reservations; it does not guarantee that a launch fits or change
-an engine's allocation ceiling. Choose a lower reserve only with room for
-application and model memory growth, and observe memory pressure and swap.
+Hand-editing the key requires a daemon restart. `0` removes only this additional
+percentage: engine cache/OS reserves (including the vLLM and SGLang guards),
+compute overhead, demand checks, and in-flight reservations remain in effect.
+The preview is host-wide and precedes per-launch demand and reservations. In an
+AMD LXC container, a fully GPU-resident launch can use the separate GTT-only
+budget; launches with CPU-side weights retain the RAM/GTT minimum. Reducing
+headroom does not guarantee a launch fits. Observe memory pressure and swap.
+
+**Development-build rename:** the unmerged Apple-only feature used
+`daemon.apple_memory_reserve_percent`. Rename that key to
+`daemon.unified_memory_reserve_percent`, keeping its numeric value (for example,
+`1` stays `1`). There is no legacy alias. Omit the key or use `auto` to restore
+the platform default. Installations still running the Apple-only build must
+keep the old key until upgrading.
 
 #### `--force` (launch through an admission refusal)
 
@@ -2040,7 +2057,7 @@ These are the defaults. Override any binding via the `keybindings:` block in `co
 | `Enter`                                       | On an idle model: open the launch picker. On a model that is running: focus the right pane on its first tab (`Requests`), with no picker staged                                                                                                              |
 | `u` / `c` / `p`                               | Yank URL / curl / model path. `y` is a vi-style alias for `c`.                                                                                                                                           |
 | `t` / `Shift+T`                               | Cycle theme forward / backward                                                                                                                                                                           |
-| `m` · `Alt+M` | Edit the Apple Silicon memory reserve with a live budget preview; saves to `daemon.apple_memory_reserve_percent`. |
+| `m` · `Alt+M` | Edit unified-memory headroom with a live budget preview; saves to `daemon.unified_memory_reserve_percent`. |
 | `Alt+L` (`⌥L` on macOS)                       | Cycle the left/right pane split through `left_pane_ratios` (wide mode; session-only). `100` hides the right pane, `0` hides the list.                                                                    |
 | `Tab` / `Shift+Tab`                           | Move focus across panes (`h` / `l` do the same — Left/Right arrows are intentionally unbound on Models to avoid an asymmetric pane-jump)                                                                 |
 | `Shift+M` / `Shift+L` / `Shift+C` / `Shift+S` / `Shift+Q` | Jump focus to Models / Logs / Chat / Settings / Requests respectively. `L` and `C` only fire when the focused model is running, `Q` when it has a launch.                                    |

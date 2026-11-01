@@ -222,14 +222,23 @@ On a UMA host the gate budgets `min(ram_free, gtt_free)` (`admission::effective_
 
 **Make-room, then refuse.** When admission refuses a **proxy auto-start**, the proxy does not answer 503 yet: `eviction::make_room` takes the refusal's own numbers back out of the error `data` and unloads idle launches, least-recently-used first (MRU stamps, a launch never touched sorts oldest), stopping at the first set whose credit covers the shortfall. Then it waits for the sampled free memory to catch up (up to 20 s, or two sampler ticks when `daemon.metrics_interval_secs` is above 10 s, since the retry is priced on the same sample) and retries the launch once; admission runs again and stays the authority. It is all-or-nothing: if every eligible launch together cannot cover the shortfall, nothing is stopped, because unloading models for a launch that still will not fit is a pure loss. Never a candidate: a launch with a request in flight, a non-auto-start launch (manual or preloaded), a launch whose preset pins `idle_ttl_secs: 0`, and one nothing can size. A launch is stopped only after a fresh check that it is still `Ready` with nothing in flight, since selection happens up to the stop grace before the stop. Credit uses `launch_resident_bytes`, the same figure admission measures a launch with, so a launch and a split GGUF are both sized across every shard. `start --force` and the CLI/TUI paths never make room; the refusal stands and `--force` is the operator's own override.
 
-**Live Apple admission reserve.** `daemon.apple_memory_reserve_percent` defaults
-to 25 and accepts integers from 0 to 99. `daemon::memory_policy::MemoryPolicy`
-serializes updates, writes the one config leaf through the comment-preserving
-writer, then publishes the new percentage. A failed write leaves admission
-unchanged. In-process reserve and preset writers share a lock so a concurrent preset edit
-cannot overwrite the reserve edit. Admission, proxy make-room waits and the
-backends' shared-memory budget calculations read the same live value; other
-pool types retain their original policy. Running launches are unaffected.
+**Live UMA admission reserve.** `daemon.unified_memory_reserve_percent` is
+`auto` (default) or an integer 0–99. `launch::headroom::MemoryReserve` validates
+and serializes this scalar for config and IPC. Auto keeps 25% on Apple Silicon
+and adds no percentage on other UMA hosts; explicit overrides affect only UMA.
+`admission::available_pool_bytes` chooses the existing RAM/GTT-constrained pool
+(or the launch-specific LXC exception), then the shared headroom calculation
+applies once. Engine cache/OS reserves, compute overhead, and the in-flight
+ledger remain independent.
+
+`daemon::memory_policy::MemoryPolicy` serializes updates, writes the config leaf
+through the comment-preserving writer, then publishes the new setting. A failed
+write leaves admission unchanged; a disconnected caller cannot interrupt the
+persist/publish sequence. Reserve and preset writers share the config mutation
+lock. Admission, proxy make-room waits, and backend shared-memory budgeting read
+the same live setting. Running launches are unaffected. Status and the editor
+share the host-wide pre-reservation budget; an LXC GPU-only launch can have a
+different budget as described above.
 
 ### DeepSeek-V4 KV estimate
 
@@ -552,8 +561,8 @@ JSON-RPC error codes follow the spec (`-32601 Method not found`, `-32602 Invalid
 
 `proxy_aliases` audits the `proxy.aliases` table against the catalog: the table is built once per daemon (`src/proxy/alias.rs`) and shared with the proxy through `MethodContext`, so its once-per-name warn set is one object process-wide. The same states the audit reports, the two proxy listings act on and the startup report logs — the report runs once the catalog has its first row, because before it does every target would read `dead`.
 
-`memory_reserve_set` takes `{apple_memory_reserve_percent: 0..99}` and returns
-the saved percentage. Unknown fields and invalid values are refused. A save
+`memory_reserve_set` takes `{unified_memory_reserve_percent: "auto" | 0..99}` and returns
+the updated `daemon.memory` snapshot after persistence succeeds. Unknown fields and invalid values are refused. A save
 requires a writable config path. The TUI's m-key editor uses this method and
 only reports success after the daemon has persisted the change.
 
@@ -572,7 +581,7 @@ Beyond the `models` / `external` / `gpu` shapes, the `status` response carries t
   - `gpu_devices` (`Option<[…]>`) — present only on multi-GPU / multi-backend hosts, one row per device: `{selector, backend, name, total_memory_bytes, used_memory_bytes?, utilization_pct?, temperature_c?}` (`?` = omitted when the vendor tool doesn't surface it). `selector` is a backend-prefixed *display* label (`Nvidia0`, `Amd0`), **not** a `--device` value — launch selection draws from the `servers` catalog instead.
 - **`servers`** — `{id, backend_id, binary, name, devices, label?}` per configured server. Every launch-device surface reads this (it replaced the old flat `device_catalog`). `label` is the display name: the configured `name:`, else the probed compute backends (`rocm+vulkan`), else the build folder on a collision or a failed probe (`probe_devices` returns `None`), else the backend's `deviceless_accelerator` when its probe answered with no devices (llama.cpp: `cpu`); repeats get `-2`; omitted when none applies.
 - **`backends`** — one row per registered backend: `{id, installed, accelerators, server_labels, enabled?, binary?}`. `server_labels` is one label per `servers` entry of that backend, in catalog order, then the backend's `status_server_labels` (generic: entries without `model:`, which never reach the catalog); a server without a `label` reads as the backend's `accelerators` joined with `|`, else its binary's file name.
-- **`daemon.memory`** — `{apple_memory_reserve_percent, apple_unified, available_bytes, admissible_bytes}`. The byte figures are sampled total-minus-used RAM and the post-reserve launch budget before in-flight reservations; they are null without an Apple Silicon memory sample. Host memory gauges continue to show raw totals.
+- **`daemon.memory`** — `{unified_memory_reserve_percent, unified, default_reserve_percent, available_bytes, admissible_bytes}`. The setting is `"auto"` or an integer 0–99. The optional default is 25 on Apple Silicon, 0 on other detected UMA hosts, and null when UMA policy is unavailable. Available bytes are the host-wide constrained pool before additional headroom; admissible bytes apply the configured headroom before in-flight reservations. Byte figures are null without a usable UMA memory sample. `MemoryBudget::preview` uses the same pure percentage calculation as admission. Host memory gauges continue to show raw totals.
 - **`daemon.build`** — semver from `CARGO_PKG_VERSION`; matches `--version`.
 - **`daemon.server_path`** — absolute path to the `llama-server` binary resolved at startup, `null` when unset.
 - **`daemon.preload`** — `{entries, presets}`: the `daemon.preload:` list as configured and the number of preset entries pinning `preload: true`. Always present, empty when nothing is configured, so "preload not asked for" is distinguishable from "not read". Whether a given entry actually came up is visible in `models[]`, because a preloaded launch is an ordinary running row (`origin: manual`) that a refusal skips with one log line.

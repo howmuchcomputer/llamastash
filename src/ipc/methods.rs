@@ -46,19 +46,18 @@ pub async fn dispatch_request(ctx: &MethodContext, req: Request) -> Response {
       #[derive(Deserialize)]
       #[serde(deny_unknown_fields)]
       struct Params {
-        #[serde(deserialize_with = "crate::config::loader::deserialize_memory_reserve_percent")]
-        apple_memory_reserve_percent: u8,
+        unified_memory_reserve_percent: crate::launch::headroom::MemoryReserve,
       }
       match parse_params::<Params>(req.params) {
         Err(error) => Response::err(id, error),
         Ok(params) => match ctx
           .memory_policy
-          .set(params.apple_memory_reserve_percent)
+          .set(params.unified_memory_reserve_percent)
           .await
         {
           Ok(()) => Response::ok(
             id,
-            json!({"apple_memory_reserve_percent": params.apple_memory_reserve_percent}),
+            json!(ctx.memory_policy.budget(ctx.host_metrics.as_ref()).await),
           ),
           Err(error) => Response::err(
             id,

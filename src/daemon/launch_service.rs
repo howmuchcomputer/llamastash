@@ -1227,7 +1227,7 @@ pub(crate) async fn spawn_supervised(
           crate::launch::admission::effective_free_bytes_for(
             &snapshot,
             gtt_only,
-            ctx.memory_policy.percent(),
+            ctx.memory_policy.reserve(),
           ),
           gtt_only,
         )

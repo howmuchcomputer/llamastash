@@ -572,7 +572,7 @@ fn build_default_bindings() -> Vec<Binding> {
   });
   v.extend_from_slice(&binds! {
     action: Action::OpenMemoryReserve, scopes: FocusSet::NAV,
-    hint: "memory", description: Some("edit Apple Silicon memory reserve"),
+    hint: "memory", description: Some("edit unified memory reserve"),
     chords: [
       (KeyCode::Char('m'), KeyModifiers::NONE, "m", CAT_GLOBAL),
       (KeyCode::Char('m'), KeyModifiers::ALT, crate::alt_label!("M"), NO_CAT),
