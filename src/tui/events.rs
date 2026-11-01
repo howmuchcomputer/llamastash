@@ -2761,7 +2761,7 @@ fn apply_refresh(app: &mut App, tick: RefreshTick) {
         .filter(|dialog| dialog.saving && method == "memory_reserve_set")
       {
         dialog.saving = false;
-        dialog.error = Some(format!("Save failed: {message}"));
+        dialog.error = Some(message.clone());
       }
       // A refused start produces no row to watch, so its bell watch would hang
       // around. The error carries no path, so nothing is dropped here: that watch
@@ -3126,6 +3126,46 @@ mod tests {
     apply_refresh(&mut app, RefreshTick::MemoryReserveSaved(saved.clone()));
     assert_eq!(app.memory_budget, Some(saved));
     assert!(app.memory_dialog.is_none());
+  }
+
+  #[test]
+  fn memory_modal_shows_the_flow_config_recovery_instruction() {
+    use ratatui::{backend::TestBackend, Terminal};
+    let error = crate::config::yaml_edit::upsert(
+      "{theme: latte}\n",
+      &["daemon", "unified_memory_reserve_percent"],
+      "10",
+    )
+    .unwrap_err();
+    for (width, height) in [(80, 24), (60, 20)] {
+      let mut app = App::new(AppOptions::default());
+      let mut dialog = crate::tui::memory_dialog::MemoryDialog::open(MemoryReserve::AUTO);
+      dialog.saving = true;
+      app.memory_dialog = Some(dialog);
+      apply_refresh(
+        &mut app,
+        RefreshTick::WriterError {
+          method: "memory_reserve_set",
+          message: format!("daemon error -32603: {error}"),
+        },
+      );
+      let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+      let drawn = terminal
+        .draw(|frame| crate::tui::render::render(frame, &mut app))
+        .unwrap();
+      let text = drawn
+        .buffer
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+      for required in ["convert", "block YAML", "before saving"] {
+        assert!(
+          text.contains(required),
+          "{width}x{height}: missing {required}: {text}"
+        );
+      }
+    }
   }
 
   #[test]

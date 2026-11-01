@@ -481,7 +481,7 @@ fn guard_ancestors_block(doc: &Document, path: &[&str], i: usize) -> Result<(), 
 
 fn flow_err(key: &str) -> WriteError {
   WriteError::Patch(format!(
-    "config key `{key}` uses flow / non-block style; edit it by hand or convert it to block style before writing there"
+    "convert `{key}` to block YAML before saving; non-empty flow mappings are not editable here"
   ))
 }
 
