@@ -18,6 +18,13 @@ use crate::cli::output::pretty_json;
 use crate::cli::resolve::{fetch_status, resolve_running_via_catalog, ExternalRow, RunningRow};
 use crate::config::Config;
 
+/// IPC budget for a stop: the daemon waits up to the grace (the flag, else at
+/// least `floor`) for SIGTERM before SIGKILL, and a client timeout inside that
+/// window cancels the handler and leaves a half-cleaned row.
+pub(crate) fn stop_deadline(grace: Option<u64>, floor: u64) -> std::time::Duration {
+  std::time::Duration::from_secs(grace.unwrap_or(5).max(floor).saturating_add(5))
+}
+
 pub async fn handle(args: StopArgs, cli: &Cli, config: &Config) -> CliResult {
   let mut client = connect_or_spawn(cli, config).await?;
   let grace = args.grace_secs;
@@ -60,18 +67,15 @@ pub async fn handle(args: StopArgs, cli: &Cli, config: &Config) -> CliResult {
     if let Some(g) = grace {
       params.insert("grace_secs".into(), serde_json::Value::from(g));
     }
-    // Per-launch grace runs in parallel inside the daemon, but the
-    // wall-clock is bounded by the slowest stop. Size the IPC budget
-    // around `grace + slop` so a long custom grace doesn't trip the
-    // default 5-second deadline (`R-01`).
+    // Per-launch grace runs in parallel inside the daemon, so the slowest
+    // launch's grace bounds the wall-clock.
     let floor = snap
       .models
       .iter()
       .map(|r| r.stop_grace_secs)
       .max()
       .unwrap_or(0);
-    let grace_for_timeout = grace.unwrap_or(5).max(floor);
-    let ipc_deadline = std::time::Duration::from_secs(grace_for_timeout.saturating_add(5));
+    let ipc_deadline = stop_deadline(grace, floor);
     let resp = client
       .call_with_timeout(
         "stop_all",
@@ -154,13 +158,7 @@ pub async fn handle(args: StopArgs, cli: &Cli, config: &Config) -> CliResult {
   if let Some(g) = grace {
     params["grace_secs"] = serde_json::Value::from(g);
   }
-  // The daemon-side stop waits up to `grace` for SIGTERM before SIGKILL, then
-  // does its own teardown bookkeeping — a slow child can run the full grace
-  // window. Size the IPC budget around
-  // `grace + slop` so the client doesn't time out mid-stop and cancel the
-  // handler, leaving a half-cleaned row (matches `stop_all` above).
-  let grace_for_timeout = grace.unwrap_or(5).max(row.stop_grace_secs);
-  let ipc_deadline = std::time::Duration::from_secs(grace_for_timeout.saturating_add(5));
+  let ipc_deadline = stop_deadline(grace, row.stop_grace_secs);
   let resp = client
     .call_with_timeout("stop_model", Some(params), ipc_deadline)
     .await
@@ -338,6 +336,15 @@ pub(crate) fn confirm_from<R: Read>(input: &mut R, models: &[RunningRow]) -> Res
 mod tests {
   use super::*;
   use std::io::Cursor;
+
+  #[test]
+  fn stop_deadline_covers_the_longest_grace_plus_slop() {
+    use std::time::Duration;
+    assert_eq!(stop_deadline(None, 0), Duration::from_secs(10));
+    assert_eq!(stop_deadline(None, 30), Duration::from_secs(35));
+    assert_eq!(stop_deadline(Some(2), 0), Duration::from_secs(7));
+    assert_eq!(stop_deadline(Some(2), 20), Duration::from_secs(25));
+  }
 
   fn dummy_rows() -> Vec<RunningRow> {
     vec![RunningRow {

@@ -21,6 +21,7 @@ use crate::cli::output::pretty_json;
 use crate::cli::resolve::{fetch_catalog, fetch_status, resolve_model, CatalogRow, RunningRow};
 use crate::cli::session::{not_chat, proxy_api_key, proxy_base_url, published_id};
 use crate::cli::start::{map_start_error, preset_baseline, start_payload, PartialParams};
+use crate::cli::stop::stop_deadline;
 use crate::config::Config;
 use crate::ipc::Client;
 use crate::launch::presets::AUTO_DEFAULT;
@@ -512,11 +513,11 @@ async fn served_row(
   }
   if row.is_error() {
     let note = row.note();
-    let status = row.status.map(|s| s.to_string()).unwrap_or_default();
+    let status = row.status.map(|s| format!(" {s}")).unwrap_or_default();
     return Err(if note.is_empty() {
-      format!("the proxy answered {status}")
+      format!("the proxy answered{status} with an error")
     } else {
-      format!("the proxy answered {status}: {note}")
+      format!("the proxy answered{status}: {note}")
     });
   }
   Ok(row)
@@ -578,8 +579,6 @@ async fn is_ready(client: &mut Client, launch_id: &str) -> bool {
 /// Stop one launch this command started. A failure is that preset's note, not an
 /// abort: the remaining presets still get measured.
 async fn stop(client: &mut Client, launch_id: &str) -> Result<(), String> {
-  // The daemon can wait the launch's full stop grace before SIGKILL; a client
-  // timeout inside it cancels the stop half-done. Same budget `stop` uses.
   let grace = fetch_status(client)
     .await
     .ok()
@@ -589,7 +588,7 @@ async fn stop(client: &mut Client, launch_id: &str) -> Result<(), String> {
     .call_with_timeout(
       "stop_model",
       Some(json!({ "launch_id": launch_id })),
-      Duration::from_secs(grace.max(5).saturating_add(5)),
+      stop_deadline(None, grace),
     )
     .await
     .map(|_| ())
@@ -597,10 +596,12 @@ async fn stop(client: &mut Client, launch_id: &str) -> Result<(), String> {
 }
 
 /// A launch of `path` that still holds the model, i.e. is not stopped or errored.
+fn is_live_of(row: &RunningRow, path: &str) -> bool {
+  row.model_path == path && !matches!(row.state.as_str(), "stopped" | "error")
+}
+
 fn live_launch_of<'a>(rows: &'a [RunningRow], path: &str) -> Option<&'a RunningRow> {
-  rows
-    .iter()
-    .find(|r| r.model_path == path && !matches!(r.state.as_str(), "stopped" | "error"))
+  rows.iter().find(|r| is_live_of(r, path))
 }
 
 /// How to point at a launch in a message: its id, plus its name when it has one.
@@ -619,11 +620,7 @@ async fn stop_live_of(client: &mut Client, path: &str) -> Vec<String> {
     return Vec::new();
   };
   let mut stopped = Vec::new();
-  for row in snap
-    .models
-    .iter()
-    .filter(|r| r.model_path == path && !matches!(r.state.as_str(), "stopped" | "error"))
-  {
+  for row in snap.models.iter().filter(|r| is_live_of(r, path)) {
     let label = describe_launch(row);
     match stop(client, &row.launch_id).await {
       Ok(()) => stopped.push(label),

@@ -336,7 +336,7 @@ fn fmt_count(n: u64) -> String {
 /// A speed for a table cell: one decimal below 1000, a whole number to
 /// 99,999.4, and whole thousands with a `k` from there up, so `~` plus the
 /// value always fits the six cells the column gives it.
-pub(crate) fn fmt_tps(v: f64) -> String {
+fn fmt_tps(v: f64) -> String {
   // One decimal of thousands rounds up to `1000.0` from here, which costs a
   // cell more than the column has.
   const WHOLE_FROM: f64 = 999.95;
