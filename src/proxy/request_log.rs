@@ -352,7 +352,7 @@ fn fmt_tps(v: f64) -> String {
 }
 
 /// A duration for a table cell: `850ms`, `1.2s`, `2m05s`, `1h02m`.
-fn fmt_ms(ms: u64) -> String {
+pub(crate) fn fmt_ms(ms: u64) -> String {
   let secs = ms / 1000;
   if ms < 1000 {
     format!("{ms}ms")

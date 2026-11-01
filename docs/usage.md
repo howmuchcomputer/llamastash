@@ -626,6 +626,85 @@ What is and is not recorded:
 - Where no prefill timing arrives, the proxy estimates one and sets `prefill_estimated`: for a stream, the time from sending the request to its first token. The first byte is not used, because some engines open a stream with a status event (`message_start`, `response.created`) before they compute the prompt: Halogen 0.18.4, vLLM 0.27.1 and Gufo f711612 sent one 2 to 48 ms after the request, and timing to it read 8 to 2,200 times too fast. A stream with no token event the proxy recognises gets no estimate. For a response that arrives whole, the whole wait minus the generation the engine reported its speed for. It needs the cached count, because without it the proxy cannot tell computed tokens from cache hits and an agent prompt is mostly cache hits. Measured from the send, so routing and a model auto-start's load stay out; a request that waits inside the engine for a slot counts that wait, so the figure reads low under concurrency. With llama.cpp the estimate covers a streamed `/v1/messages` request (Claude Code). A whole `/v1/messages` or `/v1/responses` response sends no generation speed for the proxy to subtract from the wait, so it gets no estimate. A server that sends neither a prefill timing nor a cached count shows `null`.
 - `prefill_end_ms` is how long after receipt the first token arrived, recorded for a stream whose tokens the proxy could spot. `Agg PP tok/s` ends each row's window there, because the first byte can be the status event above and would cut the window to a few milliseconds while still counting the whole prompt against it. `null` for a response that arrives whole and for a stream the proxy saw no token in, where `ttfb_ms` and the reported generation are all there is to place the prompt.
 
+### `llamastash bench <model-ref> [--preset a,b]`
+
+One speed number per preset, so a knob change can be compared without the maintainer scripts in `scripts/bench/`.
+
+```
+llamastash bench <model-ref> [--preset a,b] [--runs N] [--max-tokens N] [--prompt TEXT | --prompt-file PATH] [--json] [-- <ARG>...]
+```
+
+Per preset it starts the model, waits for Ready, sends one fixed prompt `--runs` times through the proxy, reads the speeds the request log already holds for those requests, then stops the launch it started. Nothing else is stopped and nothing is unloaded to make room: a `start` from the CLI never evicts another launch, so a preset the machine cannot fit is that row's error and the remaining presets are still measured.
+
+```
+PRESET  LOAD  CTX    IN   OUT  PP tok/s  TG tok/s  TTFT   RUNS  NOTE
+small   2.2s  4096   969  64   1457      35.2      681ms  2/2   -
+big     2.2s  16384  969  64   1281      27.1      836ms  2/2   -
+```
+
+- `--preset a,b` names saved presets, comma-separated, benched in that order. Without it, one cycle on the model's `default:` preset, which is the baseline a plain `start <model-ref>` uses. `auto` benches pure fit (no preset, no last-used params) and reads as the row `auto`. A name that is not saved is a usage error raised before anything starts, so a typo costs no model load.
+- Every per-launch override `start` takes works here and is layered exactly as it is on `start`: the preset's own params, the overrides on top, for every preset in the list. With `--ctx 4096` on the command line every row measures a 4096 context, whatever context each preset sets. The one exception is `--mode`, which takes only `chat` here; a preset that pins a non-chat mode is that row's error rather than an up-front refusal, because it is only visible once the launch is up.
+- `LOAD` is the wall clock from the start call to the Ready row, so it carries the model load. `CTX` is the context window the launch ended up with, as `status` reports it (`resolved_ctx`), so a preset that leaves the context to the engine's fitter shows what it chose. `IN` and `OUT` are the prompt tokens and the generated tokens per request. `PP tok/s` and `TG tok/s` are prompt-processing and generation speed, `TTFT` the time to the first token. Each is the median over the runs that finished, read from the same fields [`llamastash requests`](#llamastash-requests-model-ref) prints, from this launch's own rows only. A leading `~` marks a figure the proxy estimated because the server reported none, exactly as in `requests`; a metric no run reported reads `-` rather than 0.
+- `RUNS` is runs that finished over runs asked for. Bench reads each run from the proxy's request log, so it assumes nothing else sends requests to that model while it runs; another client's request can be counted as one of its runs. `NOTE` says what went wrong when a preset produced no numbers: an admission refusal, a launch that settled in `error`, a stop that failed.
+- `--runs` (default 3, at least 1) and `--max-tokens` (default 256) size the work. The prompt is `--prompt`, or a file through `--prompt-file`, or a built-in fixed passage of about 1,000 tokens when neither is given, long enough that prompt processing is worth measuring. Every request sends a `Run <n>.` prefix, so the second run prefills the prompt again instead of answering from the KV cache the first one filled.
+- Progress (`starting fast…`, `fast: run 2/2`) goes to stderr and is silent under `--json` and `--quiet`; the table and the JSON go to stdout. Piped stdout gets the header plus one tab-separated line per preset. Ctrl-C stops whatever launches of that model are still up, then exits `71` (`UNKNOWN`) without printing results.
+- Chat models only, and the model must not already be running: `bench` refuses and names the running launch before starting anything, because a launch you started carries the params it started with, not the ones under test.
+
+`--json` emits `{ "model": ..., "model_path": ..., "runs": ..., "max_tokens": ..., "results": [...] }`, one result per preset in the order asked for. Every key is always present and a figure no run reported is `null`. `preset` is `null` for the `default:` baseline; `error` is `null` for a preset that produced numbers and the reason it did not otherwise; `launch_id` names the launch that produced them and `name` its launch name. `ctx`, `params` (the launch's resolved params and knobs) and `rss_bytes` (the engine process's resident memory after the runs, not counting GPU memory) are read from `status` before the launch is stopped. `prefill_tokens` is the part of the prompt the engine computed and `cached_tokens` the part it reused from its KV cache, which the `Run <n>.` prefix keeps near 0; `duration_ms` is the whole request. A preset that failed still gets its result object, so stdout stays parseable when the exit code is `67`.
+
+```json
+{
+  "model": "decider-4b-v3-Q4_K_M.gguf",
+  "model_path": "/mnt/work/models/decider-4b/decider-4b-v3-Q4_K_M.gguf",
+  "runs": 1,
+  "max_tokens": 16,
+  "results": [
+    {
+      "preset": "small",
+      "launch_id": "L3",
+      "name": "small",
+      "load_ms": 2150,
+      "ctx": 4096,
+      "params": {
+        "mode": "chat",
+        "ctx": 4096,
+        "knobs": { "ctx-size": 4096, "n-gpu-layers": "auto" },
+        "...": "the rest of the launch's params, as `status` shows them"
+      },
+      "rss_bytes": 1654960128,
+      "prompt_tokens": 969,
+      "prefill_tokens": 969,
+      "cached_tokens": 0,
+      "prefill_tokens_per_second": 1393.514763490776,
+      "prefill_estimated": false,
+      "completion_tokens": 16,
+      "tokens_per_second": 35.19375334340657,
+      "tokens_per_second_estimated": false,
+      "ttft_ms": 701,
+      "duration_ms": 1128,
+      "runs_done": 1,
+      "error": null,
+      "samples": [
+        {
+          "prompt_tokens": 969,
+          "prefill_tokens": 969,
+          "cached_tokens": 0,
+          "completion_tokens": 16,
+          "prefill_tokens_per_second": 1393.514763490776,
+          "prefill_estimated": false,
+          "tokens_per_second": 35.19375334340657,
+          "tokens_per_second_estimated": false,
+          "ttft_ms": 701,
+          "duration_ms": 1128
+        }
+      ]
+    }
+  ]
+}
+```
+
+`samples` holds one object per finished run with the same metric keys before aggregation, which is where the spread the median hides lives. `runs_done` counts them.
+
 ### `llamastash presets <model-ref> <action>`
 
 ```
@@ -1894,14 +1973,14 @@ Source of truth: `src/cli/exit_codes.rs`. Codes are part of the public CLI contr
 | Code | Constant               | Meaning                                                                                                                                                |
 | ---- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `0`  | `SUCCESS`              | Success                                                                                                                                                |
-| `64` | `USAGE`                | Bad CLI usage — missing required arg, invalid flag combination, or config-load error. Clap also emits this on its own. `session` uses it for a MODEL that is an embedding or rerank model, and for no TOOL where a picker cannot run. |
+| `64` | `USAGE`                | Bad CLI usage — missing required arg, invalid flag combination, or config-load error. Clap also emits this on its own. `session` uses it for a MODEL that is an embedding or rerank model, and for no TOOL where a picker cannot run. `bench` uses it for a model that is not a chat model, a model that is already running, and a `--preset` name that is not saved. |
 | `65` | `DAEMON_UNREACHABLE`   | Daemon socket missing, peer hung up, or call timed out. `session` also uses it when the daemon is up but its proxy is not listening, since the tool's traffic has to reach it. |
-| `66` | `MODEL_NOT_FOUND`      | Model reference matched zero or multiple catalog rows; stderr carries a disambiguation hint. `session` also uses it when no chat model is running and none was named. |
-| `67` | `LAUNCH_FAILED`        | Daemon accepted `start_model` but the supervisor failed (probe timeout, port allocation, etc.). `session` also uses it when the launch it waited on settled in `error` or `stopped`, or never settled. |
+| `66` | `MODEL_NOT_FOUND`      | Model reference matched zero or multiple catalog rows; stderr carries a disambiguation hint. `session` also uses it when no chat model is running and none was named. `bench` uses it for a reference that matches no catalog row. |
+| `67` | `LAUNCH_FAILED`        | Daemon accepted `start_model` but the supervisor failed (probe timeout, port allocation, etc.). `session` also uses it when the launch it waited on settled in `error` or `stopped`, or never settled. `bench` uses it when at least one preset produced no numbers or a launch it started could not be stopped afterwards; the results it did measure are still printed. |
 | `68` | `STOP_FAILED`          | `stop` couldn't reach the target (daemon error or process gone)                                                                                        |
 | `69` | `PULL_FAILED`          | `pull` couldn't complete (network, integrity, disk space)                                                                                              |
 | `70` | `BINARY_NOT_FOUND`     | The engine the model needs is unavailable: neither `llama-server` nor `llama` on PATH, with no `--llama-server` flag and `LLAMASTASH_LLAMA_SERVER` unset, or the model's backend is disabled / its launcher missing. `session` uses it when the tool binary (`claude`, `codex`, `opencode`, `pi`, `aider`) is not on PATH |
-| `71` | `UNKNOWN`              | Catch-all for unexpected errors that don't map to a documented class. `session` uses it when no cache directory is available for a per-run file, or writing one fails |
+| `71` | `UNKNOWN`              | Catch-all for unexpected errors that don't map to a documented class. `session` uses it when no cache directory is available for a per-run file, or writing one fails. `bench` uses it when Ctrl-C interrupts it. |
 | `72` | `INIT_ABORTED`         | `init` aborted before smoke — integrity check failed, archive defenses tripped, user declined confirm, or non-TTY config step without explicit consent |
 | `73` | `INIT_DOWNLOAD_FAILED` | `init`'s model-download step failed (distinct from `PULL_FAILED` so agents branch on cause)                                                            |
 | `74` | `INIT_SMOKE_FAILED`    | `init`'s smoke phase failed (binary doesn't run cleanly under `--version`)                                                                             |
