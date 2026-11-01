@@ -182,6 +182,55 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn empty_root_config_save_survives_reload() {
+    for original in [
+      "{}\n",
+      "# before\n{} # defaults\n# after\n",
+      "---\n{}\n...\n",
+    ] {
+      let dir = crate::util::test_temp::unique_temp_dir("memory-empty-root");
+      std::fs::create_dir_all(&dir).unwrap();
+      let path = dir.join("config.yaml");
+      std::fs::write(&path, original).unwrap();
+      let policy = MemoryPolicy::new(MemoryReserve::AUTO, Some(path.clone()));
+      policy
+        .set(MemoryReserve::percent(10).unwrap())
+        .await
+        .unwrap();
+      let text = std::fs::read_to_string(&path).unwrap();
+      let config: crate::config::Config =
+        yaml_serde::from_str(&text).expect("a saved default config must remain loadable");
+      assert_eq!(
+        config.daemon.unified_memory_reserve_percent,
+        policy.reserve()
+      );
+      for comment in ["# before", "# defaults", "# after"] {
+        if original.contains(comment) {
+          assert!(text.contains(comment), "{text}");
+        }
+      }
+      std::fs::remove_dir_all(dir).unwrap();
+    }
+  }
+
+  #[tokio::test]
+  async fn nonempty_flow_root_is_refused_without_changing_file_or_policy() {
+    let dir = crate::util::test_temp::unique_temp_dir("memory-flow-root");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.yaml");
+    let original = "{theme: latte}\n";
+    std::fs::write(&path, original).unwrap();
+    let policy = MemoryPolicy::new(MemoryReserve::AUTO, Some(path.clone()));
+    assert!(policy
+      .set(MemoryReserve::percent(10).unwrap())
+      .await
+      .is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    assert_eq!(policy.reserve(), MemoryReserve::AUTO);
+    std::fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[tokio::test]
   async fn reset_to_auto_survives_reload_and_concurrent_preset_edits() {
     let dir = crate::util::test_temp::unique_temp_dir("memory-policy-concurrent");
     std::fs::create_dir_all(&dir).unwrap();

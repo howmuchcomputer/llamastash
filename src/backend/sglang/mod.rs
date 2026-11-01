@@ -579,9 +579,6 @@ fn sglang_argv(params: &LaunchParams, port: u16) -> Vec<std::ffi::OsString> {
 mod tests {
   use super::*;
 
-  /// A backend declares only what it actually honors: declaring a knob is
-  /// claiming it, and a claimed knob renders an editor row and accepts a CLI
-  /// flag whose value would then go nowhere.
   #[tokio::test]
   async fn additional_headroom_reaches_the_cache_guard_without_removing_its_reserve() {
     use crate::{
@@ -640,6 +637,9 @@ mod tests {
     std::fs::remove_dir_all(dir).unwrap();
   }
 
+  /// A backend declares only what it actually honors: declaring a knob is
+  /// claiming it, and a claimed knob renders an editor row and accepts a CLI
+  /// flag whose value would then go nowhere.
   #[test]
   fn declares_a_context_knob_and_no_process_offload_knobs() {
     let b = SglangBackend::new();

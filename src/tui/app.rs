@@ -1222,6 +1222,18 @@ impl App {
     self.memory_budget = body
       .pointer("/daemon/memory")
       .and_then(|value| serde_json::from_value(value.clone()).ok());
+    if self
+      .memory_dialog
+      .as_ref()
+      .is_some_and(|dialog| !dialog.saving)
+      && !self
+        .memory_budget
+        .as_ref()
+        .is_some_and(|budget| budget.supports_editing())
+    {
+      self.memory_dialog = None;
+      self.show_error_toast("Memory reserve editing is no longer available on this daemon.");
+    }
     if let Some(daemon) = body.get("daemon") {
       // Preserve the proxy snapshot — it lives in a sibling field
       // (`body["proxy"]`) but on the same daemon-info struct so the

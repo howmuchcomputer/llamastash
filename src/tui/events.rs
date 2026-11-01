@@ -207,6 +207,7 @@ fn handle_mouse(
   use crossterm::event::{MouseButton, MouseEventKind};
   if app.hf_dialog.is_some()
     || app.confirm_dialog.is_some()
+    || app.memory_dialog.is_some()
     || app.save_preset_dialog.is_some()
     || app.launch_name_dialog.is_some()
     || app.show_help
@@ -3125,6 +3126,64 @@ mod tests {
     apply_refresh(&mut app, RefreshTick::MemoryReserveSaved(saved.clone()));
     assert_eq!(app.memory_budget, Some(saved));
     assert!(app.memory_dialog.is_none());
+  }
+
+  #[test]
+  fn memory_modal_closes_when_policy_support_disappears_but_waits_for_pending_saves() {
+    for saving in [false, true] {
+      for memory in [
+        serde_json::Value::Null,
+        serde_json::json!({"unified_memory_reserve_percent": "auto", "unified": false}),
+        serde_json::json!({"unified_memory_reserve_percent": "auto", "unified": true, "default_reserve_percent": 255}),
+      ] {
+        let mut app = App::new(AppOptions::default());
+        let mut dialog = crate::tui::memory_dialog::MemoryDialog::open(MemoryReserve::AUTO);
+        dialog.saving = saving;
+        app.memory_dialog = Some(dialog);
+        app.ingest_status(&serde_json::json!({"daemon": {"memory": memory}}));
+        assert_eq!(app.memory_dialog.is_some(), saving);
+      }
+    }
+  }
+
+  #[test]
+  fn memory_modal_blocks_mouse_clicks_and_scrolls() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
+    for saving in [false, true] {
+      let mut app = App::new(AppOptions::default());
+      app.options.mouse_focus = true;
+      app.models = (0..5)
+        .map(|i| fake_model_for_events(&format!("/m/{i}.gguf"), "/m"))
+        .collect();
+      app.focus = Focus::RightPane;
+      app.right_tab = RightTab::Logs;
+      app
+        .logs_state
+        .set_tail("1".into(), (0..20).map(|i| format!("line {i}")).collect());
+      app.hit_rects.borrow_mut().list_pane = Rect::new(0, 5, 40, 20);
+      let mut dialog = crate::tui::memory_dialog::MemoryDialog::open(MemoryReserve::AUTO);
+      dialog.saving = saving;
+      app.memory_dialog = Some(dialog);
+      for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::ScrollUp,
+        MouseEventKind::ScrollDown,
+      ] {
+        pump_input(
+          &mut app,
+          TermEvent::Mouse(MouseEvent {
+            kind,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+          }),
+        );
+        assert_eq!(app.focus, Focus::RightPane);
+        assert_eq!(app.logs_state.scroll_offset, 0);
+        assert_eq!(app.list_cursor, 0);
+      }
+    }
   }
 
   #[test]

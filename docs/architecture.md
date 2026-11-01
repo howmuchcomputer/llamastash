@@ -232,7 +232,8 @@ applies once. Engine cache/OS reserves, compute overhead, and the in-flight
 ledger remain independent.
 
 `daemon::memory_policy::MemoryPolicy` serializes updates, writes the config leaf
-through the comment-preserving writer, then publishes the new setting. A failed
+through the comment-preserving writer, which reparses the complete edited YAML
+before replacing the file, then publishes the new setting. A failed
 write leaves admission unchanged; a disconnected caller cannot interrupt the
 persist/publish sequence. Reserve and preset writers share the config mutation
 lock. Admission, proxy make-room waits, and backend shared-memory budgeting read

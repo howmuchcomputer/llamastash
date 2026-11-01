@@ -466,14 +466,18 @@ and admission budget. Invalid input leaves the estimate blank. Enter saves;
 Esc cancels (both follow the configured bindings). Saves preserve config
 comments and apply to future CLI, TUI, and proxy launches immediately, without
 restarting the daemon or its running models. A failed save leaves the live
-policy unchanged. Recent failed auto-starts can still be in the normal proxy
+policy unchanged. An empty `{}` config is expanded to block style on save;
+non-empty flow mappings must be converted to block style before editing there.
+The modal ignores background mouse clicks and scrolls while editing or saving.
+Recent failed auto-starts can still be in the normal proxy
 retry cooldown; saving does not clear it.
 
 **Alt+M** remains an alias. In macOS Terminal, it requires
 [Use Option as Meta key](https://support.apple.com/guide/terminal/trmlkbrd/mac);
 plain **m** needs no terminal change. Neither captures text typed into a filter
 or chat input. The editor is unavailable without compatible daemon policy data
-or on a host not detected as UMA.
+or on a host not detected as UMA. If policy support disappears after opening,
+the editor closes; an in-flight save waits for its acknowledgment first.
 
 ```yaml
 daemon:

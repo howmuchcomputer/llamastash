@@ -7,12 +7,10 @@
 
 - Unified-memory headroom can be adjusted in the TUI with a live admission-budget preview and platform-preserving automatic defaults; changes persist and apply without restarting the daemon ([#126](https://github.com/llamastash/llamastash/pull/126)).
 
-
 ### Changed
 
 - `init` and `recommend --json` report each recommendation's numbers as a `facts` object (`params`, `quant`, `peak_bytes`, `host_total`, `bench`, `spill_percent`) instead of a pre-rendered `justification` string; the one-line prose is rendered from it, as are the TUI's columns.
 - On a host whose sampler found several GPU backends (`multi`), the pull dialog reads the hardware from its NVIDIA or AMD card instead of treating the host as having no usable GPU, so hybrid laptops get per-file fit marks and recommendations too.
-
 
 ## [0.10.1] — 2026-10-30
 
