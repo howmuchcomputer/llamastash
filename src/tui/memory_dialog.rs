@@ -77,7 +77,10 @@ fn preview_lines(
       Span::styled(value, style),
     ])
   };
-  let bar = match available.zip(reserve.zip(budget.and_then(|b| b.default_reserve_percent))) {
+  let default_percent = budget
+    .filter(|b| b.supports_editing())
+    .and_then(|b| b.default_reserve_percent);
+  let bar = match available.zip(reserve.zip(default_percent)) {
     Some((free, (setting, default))) if free > 0 => {
       let reserve_percent = setting.resolve(default);
       let launch_cells = (usize::from(width) * usize::from(100 - reserve_percent) + 50) / 100;
@@ -132,7 +135,7 @@ fn preview_lines(
 }
 
 // Keep the end of a long or wide input visible without letting its cursor
-// escape the field into the unit or the default-value hint.
+// escape the field into the default-value hint.
 fn input_tail(input: &str) -> String {
   let marker = if input.width() > 4 {
     crate::tui::glyphs::active().ellipsis()
@@ -375,6 +378,39 @@ mod tests {
     assert!(invalid[4]
       .to_string()
       .contains(crate::tui::glyphs::active().placeholder()));
+  }
+
+  #[test]
+  fn an_incompatible_status_during_edit_blanks_the_preview_without_panicking() {
+    let mut app = App::new(AppOptions::default());
+    app.memory_budget = Some(MemoryBudget {
+      unified_memory_reserve_percent: MemoryReserve::AUTO,
+      default_reserve_percent: Some(255),
+      unified: true,
+      available_bytes: Some(40 * 1024 * 1024 * 1024),
+      admissible_bytes: None,
+    });
+    let dialog = MemoryDialog::open(MemoryReserve::AUTO);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+      .draw(|frame| {
+        render(
+          frame,
+          frame.area(),
+          &app,
+          &dialog,
+          crate::theme::palette_for(ThemeName::Mono),
+        )
+      })
+      .unwrap();
+    assert_eq!(
+      app
+        .memory_budget
+        .as_ref()
+        .unwrap()
+        .preview(MemoryReserve::AUTO),
+      None
+    );
   }
 
   #[test]
